@@ -1,0 +1,9 @@
+# Core HTTP + config
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Testing (REQUIRED for your system to work properly)
+pytest>=7.4.0
+
+# Optional but useful (future-proofing)
+rich>=13.7.0
