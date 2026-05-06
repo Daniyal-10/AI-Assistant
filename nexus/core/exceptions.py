@@ -66,3 +66,8 @@ class WorkspaceSecurityError(NexusBaseException):
 class OllamaConnectionError(NexusBaseException):
     """Cannot reach Ollama service."""
     pass
+
+
+class CloudProviderError(NexusBaseException):
+    """External cloud AI provider (e.g. Anthropic) failed."""
+    pass

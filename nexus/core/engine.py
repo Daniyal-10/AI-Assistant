@@ -9,6 +9,7 @@ from typing import List, Optional, Any
 from nexus.ai.code_intel import CodeIntelligence
 from nexus.ai.orchestrator import AIOrchestrator
 from nexus.ai.router import IntentRouter, IntentType, IntentResult
+from nexus.ai.prompts import classify_error
 from nexus.core.exceptions import (
     MaxRetriesExceeded,
     NexusBaseException,
@@ -18,7 +19,8 @@ from nexus.core.exceptions import (
     TaskPlanningError,
 )
 from nexus.core.task import Task, TaskResult, TaskStatus
-from nexus.executor.safe_exec import ExecResult, run_command, create_task_venv, get_venv_executables
+from nexus.executor.safe_exec import ExecResult, create_task_venv, get_venv_executables, run_command
+from nexus.executor.executor_factory import get_executor
 from nexus.executor.validator import build_error_context, validate_result
 from nexus.executor.workspace import Workspace
 from nexus.utils.config import config
@@ -40,10 +42,28 @@ _CONFTEST_CONTENT = (
 
 class TaskEngine:
     def __init__(self, context: Optional[Any] = None) -> None:
+        import atexit
+        
         self.ai = AIOrchestrator()
         self.context = context
         self.history = TaskHistory()
         self.code_intel = CodeIntelligence(self.ai)
+        self._executor = get_executor()
+        logger.info("TaskEngine initialized with %s", self._executor.__class__.__name__)
+
+        # Startup cleanup: remove any containers left over from a previous crash
+        try:
+            from nexus.executor.docker_exec import cleanup_orphaned_containers, is_docker_available
+            if is_docker_available():
+                cleaned = cleanup_orphaned_containers()
+                if cleaned > 0:
+                    logger.warning("Cleaned up %d orphaned containers from previous session", cleaned)
+            
+            # Register shutdown handler for clean exit
+            atexit.register(self._shutdown_cleanup)
+        except ImportError:
+            # Docker SDK not installed — skip container cleanup logic
+            logger.debug("Docker SDK not found — skipping container cleanup")
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -55,32 +75,39 @@ class TaskEngine:
         logger.info("Starting task [%s]: %s", task.id, task.raw_input[:60])
         logger.info("=" * 60)
 
-        # ── INTENT ROUTING ──────────────────────────────────────────────────
-        if intent_result is None:
-            from nexus.ai.router import IntentRouter
-            router = IntentRouter(self.ai)
-            intent_result = router.route(task.raw_input)
-            
-        task.intent = intent_result
-
-        if intent_result.intent != IntentType.TASK:
-            logger.info("Non-task intent detected: %s", intent_result.intent.value)
-            res = self._handle_non_task(task, intent_result)
-            if self.context:
-                self.context.add_task_result(
-                    task.id, res.result.summary, intent_result.intent.value, res.status.name
-                )
-            return res
-
-        workspace = Workspace(task.id)
-        workspace.create()
-        task.workspace_path = workspace.get_path()
-
-        # Create isolated venv for this task — prevents dependency conflicts
-        venv_path = create_task_venv(workspace.get_path())
-        task.venv_executables = get_venv_executables(venv_path)
-
         try:
+            # ── INTENT ROUTING ──────────────────────────────────────────────────
+            if intent_result is None:
+                from nexus.ai.router import IntentRouter
+                router = IntentRouter(self.ai)
+                intent_result = router.route(task.raw_input)
+                
+            # Safely normalise intent to string regardless of enum or raw string input
+            _intent = intent_result.intent
+            intent_val = _intent.value if isinstance(_intent, IntentType) else str(_intent).upper()
+            task.intent = intent_result
+    
+            if self.context:
+                self.context.add_message("user", task.raw_input)
+    
+            if intent_val != IntentType.TASK.value:
+                logger.info("Non-task intent detected: %s", intent_val)
+                res = self._handle_non_task(task, intent_result)
+                if self.context:
+                    self.context.add_message("assistant", res.result.summary)
+                    self.context.add_task_result(
+                        task.id, res.result.summary, intent_val, res.status.name
+                    )
+                return res
+    
+            workspace = Workspace(task.id)
+            workspace.create()
+            task.workspace_path = workspace.get_path()
+    
+            # Create isolated venv for this task — prevents dependency conflicts
+            venv_path = create_task_venv(workspace.get_path())
+            task.venv_executables = get_venv_executables(venv_path)
+    
             # ── PLANNING ─────────────────────────────────────────────────────
             task.transition(TaskStatus.PLANNING)
             plan = self.ai.generate_plan(task.raw_input, context=self.context)
@@ -107,7 +134,7 @@ class TaskEngine:
 
             # ── VALIDATE ─────────────────────────────────────────────────────
             task.transition(TaskStatus.VALIDATING)
-            test_result = self._run_tests(task.plan, workspace, task.venv_executables)
+            test_result = self._run_tests(task.plan, workspace, task)
 
             vr = validate_result(
                 result=test_result,
@@ -124,6 +151,13 @@ class TaskEngine:
                 task.record_execution_output(
                     test_result.stdout, test_result.stderr, error_ctx
                 )
+                # TERMINAL FAILURE GUARD: timeout is not fixable by AI
+                if getattr(test_result, "timed_out", False) or test_result.returncode == -1:
+                    self._fail_task(task, "Execution timed out — task killed (non-fixable)")
+                    return task
+                if getattr(test_result, "security_blocked", False):
+                    self._fail_task(task, f"Security violation blocked execution (non-fixable): {test_result.stderr[:200]}")
+                    return task
                 self._fix_loop(task, workspace, error_ctx, vr)
 
         except OllamaConnectionError as e:
@@ -142,10 +176,15 @@ class TaskEngine:
 
         finally:
             if self.context and task.result:
+                # Safely get intent value for history
+                intent_obj = getattr(task, "intent", None)
+                intent_type = getattr(intent_obj, "intent", "UNKNOWN")
+                intent_str = intent_type.value if hasattr(intent_type, "value") else str(intent_type)
+                
                 self.context.add_task_result(
                     task.id,
                     task.result.summary,
-                    getattr(task.intent, "intent", "UNKNOWN").value if hasattr(task, "intent") else "UNKNOWN",
+                    intent_str,
                     task.status.name
                 )
             
@@ -282,25 +321,65 @@ class TaskEngine:
         self,
         plan: dict,
         workspace: Workspace,
-        venv_exec: dict = None,
-    ) -> ExecResult:
+        task: Task,
+    ) -> Any: # Returns ExecResult-like object
         wdir = workspace.get_path()
         cmd = plan.get("test_command", "").strip()
 
         if not cmd:
             logger.warning("No test command available — treating as passed")
-            return ExecResult(0, "No executable target — skipped", "")
+            return run_command(["echo", "No executable target — skipped"], cwd=wdir)
 
         args = shlex.split(cmd)
         if not args:
-            return ExecResult(0, "Empty command — skipped", "")
+            return run_command(["echo", "Empty command — skipped"], cwd=wdir)
 
-        # Redirect pytest/python into the task-isolated venv
-        if venv_exec and args and args[0] in venv_exec:
-            args[0] = venv_exec[args[0]]
+        # Map to Executor methods
+        executable = os.path.basename(args[0]).lower()
+        timeout = config.exec_timeout
+        venv_path = os.path.join(wdir, ".venv")
 
-        logger.info("Running test command: %s", args)
-        return run_command(args, cwd=wdir)
+        try:
+            if executable == "pytest":
+                # Extract test dir if present
+                test_dir = "."
+                for arg in args[1:]:
+                    if not arg.startswith("-"):
+                        test_dir = arg
+                        break
+                code, out, err = self._executor.execute_tests(wdir, venv_path, test_dir, timeout)
+            elif executable in ("python", "python3") and len(args) >= 2:
+                script = args[1]
+                code, out, err = self._executor.execute_script(wdir, venv_path, script, timeout)
+            else:
+                # Fallback for raw commands (Local only for now via direct run_command)
+                logger.debug("Command '%s' not recognized by executor interface, using fallback runner", args[0])
+                res = run_command(args, cwd=wdir, timeout=timeout)
+                return res
+
+            # Convert back to ExecResult for compatibility with validator
+            # returncode -1 = killed by NEXUS timeout (local executor)
+            # returncode 124 = killed by GNU timeout wrapper
+            timed_out = (code == 124) or (code == -1)
+            return ExecResult(returncode=code, stdout=out, stderr=err, timed_out=timed_out)
+
+        except Exception as e:
+            logger.error("Executor failure: %s", e)
+            err_msg = str(e)
+            # SecurityViolation from AST gate — mark as security_blocked
+            # so the engine can treat it as terminal (unfixable by AI)
+            is_security = any(kw in err_msg for kw in [
+                "Forbidden function call",
+                "Forbidden import",
+                "Illegal file access",
+            ])
+            return ExecResult(
+                returncode=-2,
+                stdout="",
+                stderr=err_msg,
+                timed_out=False,
+                security_blocked=is_security,
+            )
 
     def _find_test_files(self, wdir: str) -> List[str]:
         found = []
@@ -342,6 +421,13 @@ class TaskEngine:
             task.increment_fix_iteration()
             logger.info("Fix iteration %d/%d", i, max_iters)
 
+            # Classify the error to give the AI a targeted fix strategy
+            _error_category = classify_error(
+                stderr=task.last_stderr or "",
+                stdout=task.last_stdout or "",
+            )
+            logger.info("Error classified as: %s", _error_category)
+
             fixed_files = self.ai.generate_fix(
                 plan=task.plan,
                 current_files=task.generated_files,
@@ -353,13 +439,12 @@ class TaskEngine:
                 context=self.context,
                 semantic_reason=current_vr.semantic_reason if current_vr else None,
                 semantic_issues=current_vr.semantic_issues if current_vr else None,
+                error_category=_error_category,
             )
 
             if not fixed_files:
                 logger.warning("Fix iteration %d returned no changes", i)
                 attempt_history.append(f"Iteration {i}: AI returned no changes.")
-                if i < max_iters:
-                    task.transition(TaskStatus.FIXING)
                 continue
 
             task.generated_files.update(fixed_files)
@@ -380,7 +465,7 @@ class TaskEngine:
 
             task.transition(TaskStatus.VALIDATING)
             test_result = self._run_tests(
-                task.plan, workspace, task.venv_executables
+                task.plan, workspace, task
             )
 
             current_vr = validate_result(
@@ -394,6 +479,17 @@ class TaskEngine:
             if current_vr.is_success:
                 self._complete_task(task, workspace, iterations=i)
                 return
+
+            # TERMINAL FAILURE GUARD: timeout inside fix loop — abort immediately
+            if getattr(test_result, "timed_out", False) or test_result.returncode == -1:
+                raise MaxRetriesExceeded(
+                    f"Execution timed out during fix iteration {i} — aborting fix loop (non-fixable)"
+                )
+            if getattr(test_result, "security_blocked", False):
+                raise MaxRetriesExceeded(
+                    f"Security violation during fix iteration {i} — aborting fix loop (non-fixable): "
+                    f"{test_result.stderr[:200]}"
+                )
 
             current_error = build_error_context(current_vr, "test")
             task.record_execution_output(
@@ -428,15 +524,19 @@ class TaskEngine:
         )
         task.transition(TaskStatus.DONE)
         logger.info("✅ DONE [%s] — %s", task.id, task.result.summary)
+        if self.context:
+            self.context.add_message("assistant", task.result.summary)
 
     def _fail_task(self, task: Task, reason: str) -> None:
         logger.error("❌ FAILED [%s]: %s", task.id, reason)
         task.result = TaskResult(
             success=False,
             summary=f"FAILED: {reason}",
-            iterations_used=task.fix_iteration,
+            iterations_used=getattr(task, "fix_iteration", 0),
         )
         task.transition(TaskStatus.FAILED)
+        if self.context:
+            self.context.add_message("assistant", task.result.summary)
 
 
     def _handle_non_task(self, task: Task, intent_result: Any) -> Task:
@@ -479,17 +579,17 @@ class TaskEngine:
             if content:
                 # Dispatch based on keywords or default to explain
                 if "refactor" in task.raw_input.lower() and target_file != "INLINE":
-                    res = self.code_intel.refactor(content, task.raw_input)
+                    res = self.code_intel.refactor(content, task.raw_input, filename=target_file)
                     summary = f"REFACTOR [{target_file}]: {res['reasoning']}\n\n```python\n{res['refactored_code']}\n```"
                 elif ("debug" in task.raw_input.lower() or "fix" in task.raw_input.lower()) and target_file != "INLINE":
-                    res = self.code_intel.debug(content, "No error log provided.")
+                    res = self.code_intel.debug(content, "No error log provided.", filename=target_file)
                     summary = f"DEBUG [{target_file}]: {res['diagnosis']}\n\nFIX: {res['fix']}"
                 elif "review" in task.raw_input.lower() and target_file != "INLINE":
-                    res = self.code_intel.review(content)
+                    res = self.code_intel.review(content, filename=target_file)
                     summary = f"REVIEW [{target_file}]: Score {res['quality_score']}/10\nIssues: {', '.join(res['issues'])}"
                 else:
                     # Default / Inline path
-                    summary = f"EXPLAIN [{target_file}]:\n" + self.code_intel.explain(content, task.raw_input)
+                    summary = f"EXPLAIN [{target_file}]:\n" + self.code_intel.explain(content, task.raw_input, filename=target_file)
             else:
                 summary = "No matching file found in project context to analyze."
 
@@ -502,3 +602,14 @@ class TaskEngine:
 
         task.transition(TaskStatus.DONE)
         return task
+
+    def _shutdown_cleanup(self) -> None:
+        """Internal cleanup handler registered with atexit to prune containers on exit."""
+        try:
+            from nexus.executor.docker_exec import cleanup_orphaned_containers, is_docker_available
+            if is_docker_available():
+                cleaned = cleanup_orphaned_containers()
+                if cleaned > 0:
+                    logger.info("Shutdown cleanup: removed %d containers", cleaned)
+        except (ImportError, Exception):
+            pass  # Never raise during interpreter shutdown

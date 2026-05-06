@@ -22,11 +22,13 @@ from nexus.ai.prompts import (
     SYSTEM_JARVIS,
     build_chat_prompt,
     build_fix_prompt,
+    classify_error,
     build_generation_prompt,
     build_plan_prompt,
     build_semantic_validation_prompt,
 )
 from nexus.core.exceptions import (
+    CloudProviderError,
     OllamaConnectionError,
     TaskGenerationError,
     TaskPlanningError,
@@ -142,9 +144,51 @@ class AIOrchestrator:
 
         return None
 
+    def _call_claude(self, system_prompt: str, user_prompt: str, iteration: int) -> Optional[str]:
+        """Call Anthropic Claude API as a fallback."""
+        if not config.anthropic_api_key:
+            logger.error("Claude fallback attempted but ANTHROPIC_API_KEY is missing")
+            return None
+
+        logger.info("Routing to Claude API fallback (fix iteration %d)", iteration)
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": config.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        payload = {
+            "model": config.fallback_model,
+            "max_tokens": 4096,
+            "temperature": 0.1,
+            "system": system_prompt,
+            "messages": [
+                {"role": "user", "content": user_prompt}
+            ],
+        }
+
+        try:
+            # Using same pattern as _call_ollama with raw requests
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            
+            usage = data.get("usage")
+            if usage:
+                logger.debug("Claude token usage: %s", usage)
+                
+            content = data.get("content")
+            if content and len(content) > 0:
+                return content[0].get("text")
+            
+            return None
+        except requests.exceptions.RequestException as e:
+            raise CloudProviderError(f"Anthropic API request failed: {e}")
+
     def generate_plan(self, user_input: str, context: Optional[Any] = None) -> Dict[str, Any]:
         logger.info("Generating plan for: %s", user_input[:80])
-        ctx_summary = context.get_recent_context() if context else ""
+        history = context.get_truncated_history(config.nexus_context_token_budget) if context else None
+        ctx_summary = context.get_recent_context(history) if context else ""
         result = self._call_with_retry(
             model=self._reason_model,
             system_prompt=SYSTEM_PLANNER,
@@ -165,7 +209,8 @@ class AIOrchestrator:
             "Generating code for %d files...",
             len(plan.get("files_to_generate", [])),
         )
-        ctx_summary = context.get_recent_context() if context else ""
+        history = context.get_truncated_history(config.nexus_context_token_budget) if context else None
+        ctx_summary = context.get_recent_context(history) if context else ""
         result = self._call_with_retry(
             model=self._code_model,
             system_prompt=SYSTEM_GENERATOR,
@@ -191,31 +236,66 @@ class AIOrchestrator:
         context: Optional[Any] = None,
         semantic_reason: Optional[str] = None,
         semantic_issues: Optional[List[str]] = None,
+        error_category: str = "UNKNOWN",
     ) -> Optional[Dict[str, str]]:
         logger.info("Requesting fix (iteration %d)...", iteration)
-        result = self._call_with_retry(
-            model=self._code_model,
-            system_prompt=SYSTEM_FIXER,
-            user_prompt=build_fix_prompt(
-                plan=plan,
-                current_files=current_files,
-                stdout=stdout,
-                stderr=stderr,
-                error=error,
-                iteration=iteration,
-                attempt_history=attempt_history or [],
-                semantic_reason=semantic_reason,
-                semantic_issues=semantic_issues,
-            ),
-            validator_fn=validate_fix,
+        user_prompt = build_fix_prompt(
+            plan=plan,
+            current_files=current_files,
+            stdout=stdout,
+            stderr=stderr,
+            error=error,
+            iteration=iteration,
+            attempt_history=attempt_history or [],
+            semantic_reason=semantic_reason,
+            semantic_issues=semantic_issues,
+            error_category=error_category,
         )
-        if result is None:
-            logger.warning("Fix attempt %d failed to produce valid output", iteration)
-            return None
-        fixed = result["fixed_files"]
-        explanation = result.get("fix_explanation", "No explanation provided")
-        logger.info("Fix explanation: %s", explanation[:200])
-        return fixed
+
+        # Iteration 1: Strictly Local (Ollama)
+        if iteration == 1:
+            result = self._call_with_retry(
+                model=self._code_model,
+                system_prompt=SYSTEM_FIXER,
+                user_prompt=user_prompt,
+                validator_fn=validate_fix,
+            )
+            return result["fixed_files"] if result else None
+
+        # Iterations 2-3: Try Local first, then Fallback
+        result = None
+        try:
+            result = self._call_with_retry(
+                model=self._code_model,
+                system_prompt=SYSTEM_FIXER,
+                user_prompt=user_prompt,
+                validator_fn=validate_fix,
+            )
+        except (OllamaConnectionError, Exception) as e:
+            logger.warning("Local model failed or unreachable (iteration %d): %s", iteration, e)
+
+        if result:
+            return result["fixed_files"]
+
+        # Local failed, attempt Claude fallback if enabled
+        if config.fallback_enabled:
+            logger.warning("Activating Claude API fallback (fix iteration %d)", iteration)
+            try:
+                raw_claude = self._call_claude(SYSTEM_FIXER, user_prompt, iteration)
+                if raw_claude:
+                    parsed = extract_json(raw_claude)
+                    if parsed and validate_fix(parsed):
+                        logger.info("Claude fallback produced valid fix")
+                        return parsed["fixed_files"]
+                    else:
+                        logger.warning("Claude fallback returned invalid response format")
+            except CloudProviderError as e:
+                logger.error("Claude fallback failed: %s", e)
+            except Exception as e:
+                logger.error("Unexpected error during Claude fallback: %s", e)
+
+        logger.warning("Fix attempt %d failed to produce valid output", iteration)
+        return None
 
     def validate_correctness(self, task: str, code: str, output: str) -> Optional[Dict[str, Any]]:
         """Stage 2: Semantic validation via LLM."""
@@ -241,7 +321,8 @@ class AIOrchestrator:
 
     def generate_chat_response(self, user_input: str, context: Optional[Any] = None) -> str:
         """Conversational response with Jarvis personality."""
-        ctx_summary = context.get_recent_context() if context else ""
+        history = context.get_truncated_history(config.nexus_context_token_budget) if context else None
+        ctx_summary = context.get_recent_context(history) if context else ""
         raw = self._call_ollama(
             model=self._reason_model,
             system_prompt=SYSTEM_JARVIS,

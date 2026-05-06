@@ -7,6 +7,8 @@ from nexus.core.context import SessionContext
 from nexus.core.task import Task, TaskStatus
 from nexus.ai.router import IntentRouter, IntentType
 from nexus.interfaces.formatter import ResponseFormatter
+from nexus.core.restorer import SessionRestorer
+from nexus.utils.history import TaskHistory
 from nexus.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -46,7 +48,11 @@ def run_interactive() -> None:
     formatter = ResponseFormatter()
     formatter.print_welcome()
 
-    context = SessionContext()
+    formatter.step("Restoring session context...")
+    history_store = TaskHistory()
+    warm_payload = SessionRestorer.restore(history_store, limit=5)
+
+    context = SessionContext(warm_history=warm_payload)
     engine = TaskEngine(context=context)
     router = IntentRouter()
 
@@ -104,7 +110,10 @@ def run_single(task_input: str) -> int:
         print("Error: empty task input.")
         return 1
 
-    context = SessionContext()
+    history_store = TaskHistory()
+    warm_payload = SessionRestorer.restore(history_store, limit=5)
+
+    context = SessionContext(warm_history=warm_payload)
     engine = TaskEngine(context=context)
     task = Task(raw_input=task_input)
     context.add_message("user", task_input)

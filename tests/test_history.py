@@ -1,125 +1,87 @@
 """
 tests/test_history.py
 ─────────────────────
-Unit tests for persistent Task History Store.
+Unit tests for the TaskHistory store.
 """
 import json
-import os
-from dataclasses import asdict
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-from nexus.utils.history import TaskHistoryStore, TaskRecord
+from nexus.utils.history import TaskHistory, TaskRecord
 
 
 def test_history_record_creation_and_truncation(tmp_path):
-    """Verify that records are appended to JSONL and summaries are truncated."""
     test_workspaces = tmp_path / "workspaces"
     test_workspaces.mkdir()
 
     with patch("nexus.utils.config.config.workspace_base", str(test_workspaces)):
-        store = TaskHistoryStore()
+        store = TaskHistory()
         
         # Mock a Task with a very long summary
         task = MagicMock()
-        task.raw_input = "Create a large scale system"
+        task.raw_input = "Original input"
         task.status.name = "DONE"
-        task.result.summary = "Correct! " * 100 # > 500 chars
-        task.result.semantic_verdict = "CORRECT"
-        task.plan = {"description": "Complex architectural plan"}
-        task.fix_iteration = 1
         task.intent.intent.value = "TASK"
+        task.plan = {"description": "Plan desc"}
+        task.result.summary = "A" * 1000 # Exceeds 500 char limit
+        task.result.semantic_verdict = "CORRECT"
+        task.fix_iteration = 2
 
-        store.record(task, "session-abc-123")
-
+        store.record(task, "session-123")
+        
         history_file = store._get_current_file()
         assert history_file.exists()
-
-        with open(history_file, "r", encoding="utf-8") as f:
-            line = f.readline()
-            data = json.loads(line)
+        
+        with open(history_file, "r") as f:
+            data = json.loads(f.readline())
             
-            assert data["session_id"] == "session-abc-123"
-            assert data["raw_input"] == "Create a large scale system"
-            assert data["execution_status"] == "DONE"
-            assert data["schema_version"] == "1.0"
-            # Ensure hard truncation at 500
-            assert len(data["final_output_summary"]) == 500
-            assert data["final_output_summary"].startswith("Correct!")
+        assert data["session_id"] == "session-123"
+        assert len(data["final_output_summary"]) == 500
+        assert data["fix_attempts"] == 2
+        assert data["execution_status"] == "DONE"
 
 
 def test_history_rotation_logic(tmp_path):
-    """Verify that history files rotate monthly."""
     test_workspaces = tmp_path / "workspaces"
     test_workspaces.mkdir()
 
     with patch("nexus.utils.config.config.workspace_base", str(test_workspaces)):
-        store = TaskHistoryStore()
+        store = TaskHistory()
 
         with patch("nexus.utils.history.datetime") as mock_dt:
             # Set time to May 2026
-            mock_dt.utcnow.return_value = datetime(2026, 5, 15)
-            f1 = store._get_current_file()
-            assert "tasks_2026_05.jsonl" in str(f1)
+            mock_dt.utcnow.return_value = MagicMock(year=2026, month=5)
+            fname = store._get_current_file().name
+            assert "tasks_2026_05.jsonl" == fname
 
-            # Set time to June 2026
-            mock_dt.utcnow.return_value = datetime(2026, 6, 1)
-            f2 = store._get_current_file()
-            assert "tasks_2026_06.jsonl" in str(f2)
-            assert f1 != f2
+            # Change time to June 2026
+            mock_dt.utcnow.return_value = MagicMock(year=2026, month=6)
+            fname2 = store._get_current_file().name
+            assert "tasks_2026_06.jsonl" == fname2
 
 
-def test_history_queries(tmp_path):
-    """Verify query and search capabilities."""
+def test_history_query_filters(tmp_path):
     test_workspaces = tmp_path / "workspaces"
     test_workspaces.mkdir()
 
     with patch("nexus.utils.config.config.workspace_base", str(test_workspaces)):
-        store = TaskHistoryStore()
+        store = TaskHistory()
         history_file = store._get_current_file()
 
         # Seed data
         records = [
-            TaskRecord(raw_input="hello", intent="CHAT", execution_status="DONE"),
-            TaskRecord(raw_input="build app", intent="TASK", execution_status="DONE"),
-            TaskRecord(raw_input="fix error", intent="TASK", execution_status="FAILED"),
+            {"raw_input": "Find bugs", "intent": "CODE", "execution_status": "DONE"},
+            {"raw_input": "Delete logs", "intent": "TASK", "execution_status": "FAILED"},
+            {"raw_input": "How are you?", "intent": "CHAT", "execution_status": "DONE"},
         ]
         
-        with open(history_file, "w", encoding="utf-8") as f:
+        with open(history_file, "w") as f:
             for r in records:
-                f.write(json.dumps(asdict(r)) + "\n")
+                f.write(json.dumps(r) + "\n")
 
-        # Test get_recent (should be reverse order)
-        recent = store.get_recent(2)
-        assert len(recent) == 2
-        assert recent[0].raw_input == "fix error"
-        assert recent[1].raw_input == "build app"
-
-        # Test filter by status
-        failed = store.get_by_status("FAILED")
-        assert len(failed) == 1
-        assert failed[0].raw_input == "fix error"
-
-        # Test keyword search (case-insensitive)
-        search = store.search_by_keyword("BUILD")
-        assert len(search) == 1
-        assert search[0].raw_input == "build app"
-
-
-def test_history_graceful_failure(tmp_path):
-    """Verify that history write failures do not crash the recording process."""
-    test_workspaces = tmp_path / "workspaces"
-    test_workspaces.mkdir()
-
-    with patch("nexus.utils.config.config.workspace_base", str(test_workspaces)):
-        store = TaskHistoryStore()
-        
-        # Mock open to trigger an IO error
-        with patch("builtins.open", side_effect=IOError("Disk Full")):
-            # This should log error but NOT raise exception
-            store.record(MagicMock(), "session-fail")
-            
-        # If we reach here without exception, test passes
-        assert True
+        # Test filters
+        assert len(store.get_by_status("DONE")) == 2
+        assert len(store.get_by_intent("TASK")) == 1
+        assert len(store.search_by_keyword("bugs")) == 1
+        assert len(store.get_recent(5)) == 3

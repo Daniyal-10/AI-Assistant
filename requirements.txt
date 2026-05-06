@@ -7,3 +7,6 @@ pytest>=7.4.0
 
 # Optional but useful (future-proofing)
 rich>=13.7.0
+
+# Infrastructure
+docker>=6.0.0,<8.0.0

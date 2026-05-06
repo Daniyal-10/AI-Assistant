@@ -10,3 +10,11 @@ requires-python = ">=3.10"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nexus*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "safety: tests for security and safety gates",
+    "integration: tests for component interaction",
+    "e2e: full pipeline end-to-end tests",
+    "requires_docker: tests that require a functional docker daemon"
+]

@@ -10,11 +10,13 @@ SECURITY DESIGN:
 - Environment sanitized (no secret leakage)
 - Captured stdout/stderr for AI feedback loop
 """
+import ast
 import os
 import signal
 import subprocess
 from dataclasses import dataclass
-from typing import List, Optional
+from pathlib import Path
+from typing import List, Optional, Any
 
 from nexus.core.exceptions import ExecutionError, SafetyViolation
 from nexus.utils.config import config
@@ -52,10 +54,11 @@ class ExecResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    security_blocked: bool = False
 
     @property
     def success(self) -> bool:
-        return self.returncode == 0 and not self.timed_out
+        return self.returncode == 0 and not self.timed_out and not self.security_blocked
 
 
 def _validate_command(args: List[str]) -> None:
@@ -86,6 +89,107 @@ def _sanitize_env() -> dict:
     return env
 
 
+def scan_for_forbidden_patterns(filepath: str, workspace_path: str) -> None:
+    """
+    Perform deterministic static analysis on generated Python code using AST walking.
+    Blocks dangerous operations (RCE, networking, unsafe filesystem access) before execution.
+    """
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            code = f.read()
+    except FileNotFoundError:
+        raise ExecutionError(f"File not found: {filepath}")
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        err_msg = f"Failed to parse Python code in {os.path.basename(filepath)}: {e.msg} at line {e.lineno}"
+        logger.warning("Static analysis gate failed: %s", err_msg)
+        raise ExecutionError(err_msg)
+    except Exception as e:
+        err_msg = f"Failed to parse Python code in {os.path.basename(filepath)}: {e}"
+        logger.warning("Static analysis gate failed: %s", err_msg)
+        raise ExecutionError(err_msg)
+
+    ws_real = Path(workspace_path).resolve()
+
+    def _get_func_name(node: Any) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return f"{_get_func_name(node.value)}.{node.attr}"
+        return ""
+
+    def _report_violation(name: str, line: int):
+        if name.startswith("open(") or name.startswith("shutil."):
+            msg = f"Illegal file access: '{name}' at line {line} in {os.path.basename(filepath)}"
+        else:
+            msg = f"Forbidden function call: {name} at line {line} in {os.path.basename(filepath)}"
+        logger.warning("Security violation: %s", msg)
+        raise ExecutionError(msg)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func_name = _get_func_name(node.func)
+            
+            # Block getattr(os, "system") style obfuscation
+            if isinstance(node.func, ast.Name) and node.func.id == "getattr":
+                if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                    _DANGEROUS_ATTRS = {
+                        "system", "popen", "execv", "execve", "execvp",
+                        "run", "Popen", "call", "check_output",
+                        "connect", "urlopen",
+                    }
+                    if node.args[1].value in _DANGEROUS_ATTRS:
+                        raise ExecutionError(
+                            f"Forbidden function call: getattr obfuscation of "
+                            f"'{node.args[1].value}' at line {node.lineno} "
+                            f"in {os.path.basename(filepath)}"
+                        )
+
+
+            # 1. RCE & Dynamic Execution
+            if func_name in {"eval", "exec", "__import__"}:
+                # Block if first arg is not a constant/literal string
+                if node.args and not isinstance(node.args[0], (ast.Constant, ast.Str)):
+                    _report_violation(func_name, node.lineno)
+
+            # 2. OS Shell/Exec
+            elif func_name in {"os.system", "os.popen", "os.execv", "os.execve", "os.execvp"}:
+                _report_violation(func_name, node.lineno)
+            
+            # 3. Subprocess
+            elif any(func_name == f"subprocess.{m}" for m in ["run", "Popen", "call", "check_output"]):
+                _report_violation(func_name, node.lineno)
+
+            # 4. Networking
+            elif any(func_name == f"socket.{m}" for m in ["socket", "connect", "create_connection"]):
+                raise ExecutionError(f"Forbidden import: socket detected at line {node.lineno}")
+            elif func_name.startswith("requests.") or func_name == "requests.request":
+                if any(m in func_name for m in ["get", "post", "put", "delete", "request"]):
+                    raise ExecutionError(f"Forbidden import: requests detected at line {node.lineno}")
+            elif func_name in {"urllib.request.urlopen", "urllib.request.urlretrieve"}:
+                _report_violation(func_name, node.lineno)
+
+            # 5. Filesystem Boundary Checks
+            elif func_name in {"open", "shutil.rmtree", "shutil.move", "shutil.copy"}:
+                if node.args:
+                    path_arg = node.args[0]
+                    # Check for literal path
+                    if isinstance(path_arg, (ast.Constant, ast.Str)):
+                        path_val = path_arg.value if hasattr(path_arg, "value") else path_arg.s
+                        try:
+                            # Resolve path relative to workspace
+                            target = (ws_real / str(path_val)).resolve()
+                            if not str(target).startswith(str(ws_real)):
+                                _report_violation(f"{func_name}({path_val})", node.lineno)
+                        except Exception:
+                            _report_violation(f"{func_name}({path_val})", node.lineno)
+                    else:
+                        # Dynamic path argument — too risky to allow for these sensitive functions
+                        _report_violation(f"{func_name}(dynamic_path)", node.lineno)
+
+
 def run_command(
     args: List[str],
     cwd: str,
@@ -111,6 +215,13 @@ def run_command(
     effective_timeout = timeout or config.exec_timeout
     env = _sanitize_env()
 
+    # --- SECURITY: PRE-EXECUTION STATIC ANALYSIS GATE ---
+    # Scan every Python file in the workspace before execution
+    for entry in os.scandir(cwd):
+        if entry.is_file() and entry.name.endswith(".py"):
+            scan_for_forbidden_patterns(entry.path, workspace_base)
+    # ---------------------------------------------------
+
     logger.info("Executing: %s (cwd=%s, timeout=%ds)", args, cwd, effective_timeout)
 
     try:
@@ -121,39 +232,44 @@ def run_command(
             stderr=subprocess.PIPE,
             env=env,
             shell=False,
-            start_new_session=True,
+            text=True,
+            preexec_fn=os.setsid  # 🔴 CRITICAL: creates process group for full cleanup
         )
 
         try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=effective_timeout)
+            stdout, stderr = proc.communicate(timeout=effective_timeout)
 
+            # Enforce output limits even in text mode
             MAX_OUTPUT = 10000
-
-            stdout_text = stdout_bytes.decode("utf-8", errors="replace")[:MAX_OUTPUT]
-            stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:MAX_OUTPUT]
+            stdout = (stdout or "")[:MAX_OUTPUT]
+            stderr = (stderr or "")[:MAX_OUTPUT]
 
             return ExecResult(
                 returncode=proc.returncode,
-                stdout=stdout_text,
-                stderr=stderr_text,
+                stdout=stdout,
+                stderr=stderr,
             )
 
         except subprocess.TimeoutExpired:
             logger.warning(
-                "Command timed out after %ds. Killing process group.",
+                "Command timed out after %ds. Killing entire process group.",
                 effective_timeout,
             )
 
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            # 🔴 Kill entire process group to prevent zombie processes
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
 
-            proc.wait()
+            try:
+                # Cleanup pipes and collect any remaining output
+                stdout, stderr = proc.communicate(timeout=1)
+                stdout = (stdout or "")[:1000]
+                stderr = (stderr or "")[:1000]
+            except Exception:
+                stdout, stderr = "", ""
 
             return ExecResult(
                 returncode=-1,
-                stdout="",
+                stdout=stdout,
                 stderr=f"[NEXUS] Process killed: exceeded {effective_timeout}s timeout.",
                 timed_out=True,
             )

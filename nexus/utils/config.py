@@ -5,12 +5,13 @@ Never hardcode values here.
 import os
 import sys
 from dataclasses import dataclass, field
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)
 class NexusConfig:
     # Ollama settings
     ollama_base_url: str = field(
@@ -20,7 +21,7 @@ class NexusConfig:
         default_factory=lambda: os.getenv("OLLAMA_CODE_MODEL", "qwen2.5-coder:7b")
     )
     ollama_reason_model: str = field(
-        default_factory=lambda: os.getenv("OLLAMA_REASON_MODEL", "llama3.1:8b")
+        default_factory=lambda: os.getenv("OLLAMA_REASON_MODEL", "qwen2.5:7b")
     )
     ollama_timeout: int = field(
         default_factory=lambda: int(os.getenv("OLLAMA_TIMEOUT", "120"))
@@ -39,6 +40,20 @@ class NexusConfig:
             os.path.join(os.path.expanduser("~"), ".nexus", "workspaces")
         )
     )
+    executor_type: str = field(
+        default_factory=lambda: os.getenv("NEXUS_EXECUTOR", "local").lower()
+    )
+
+    # Context management
+    nexus_context_token_budget: int = field(
+        default_factory=lambda: int(os.getenv("NEXUS_CONTEXT_TOKEN_BUDGET", "3000"))
+    )
+    nexus_task_history_limit: int = field(
+        default_factory=lambda: int(os.getenv("NEXUS_TASK_HISTORY_LIMIT", "10"))
+    )
+    nexus_conversation_history_limit: int = field(
+        default_factory=lambda: int(os.getenv("NEXUS_CONVERSATION_HISTORY_LIMIT", "20"))
+    )
 
     # Security
     allowed_telegram_users: list = field(
@@ -50,6 +65,17 @@ class NexusConfig:
     )
     telegram_bot_token: str = field(
         default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", "")
+    )
+
+    # Anthropic Fallback settings
+    anthropic_api_key: Optional[str] = field(
+        default_factory=lambda: os.getenv("ANTHROPIC_API_KEY")
+    )
+    fallback_enabled: bool = field(
+        default_factory=lambda: os.getenv("FALLBACK_ENABLED", "false").lower() == "true"
+    )
+    fallback_model: str = field(
+        default_factory=lambda: os.getenv("FALLBACK_MODEL", "claude-haiku-4-5-20251001")
     )
 
 
@@ -93,6 +119,10 @@ def _validate_config(cfg: NexusConfig) -> None:
             f"OLLAMA_BASE_URL must start with http:// or https://, "
             f"got '{cfg.ollama_base_url}'"
         )
+
+    # Anthropic Fallback Validation
+    if cfg.fallback_enabled and not cfg.anthropic_api_key:
+        errors.append("ANTHROPIC_API_KEY must be set if FALLBACK_ENABLED is True")
 
     if errors:
         print("\n❌ NEXUS configuration errors:")

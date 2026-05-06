@@ -112,7 +112,7 @@ class TaskHistory:
     def _query(self, filter_fn: Any = None, limit: int = 1000) -> List[TaskRecord]:
         """
         Internal query engine. Scans file from end (recent-first).
-        Bounded at 1000 records to prevent memory bloat on large files.
+        Uses a bounded backward read (max 512KB) to prevent memory bloat and guarantee speed.
         """
         file_path = self._get_current_file()
         if not file_path.exists():
@@ -120,10 +120,17 @@ class TaskHistory:
 
         results = []
         try:
-            # For simplicity, we read lines. In a production system with 
-            # huge files, we would seek from the end.
-            with open(file_path, "r", encoding="utf-8") as f:
-                lines = f.readlines()
+            MAX_BYTES = 512 * 1024  # 512 KB
+            file_size = file_path.stat().st_size
+            
+            with open(file_path, "rb") as f:
+                if file_size > MAX_BYTES:
+                    f.seek(file_size - MAX_BYTES)
+                    # Skip the first partial line
+                    f.readline()
+                content = f.read().decode("utf-8", errors="replace")
+                
+            lines = [line for line in content.splitlines() if line.strip()]
                 
             for line in reversed(lines):
                 if len(results) >= limit:

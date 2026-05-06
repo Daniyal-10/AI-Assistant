@@ -20,6 +20,7 @@ from nexus.ai.prompts import (
 )
 from nexus.utils.config import config
 from nexus.utils.logger import get_logger
+from nexus.utils.secret_scanner import scan_content_safe
 
 logger = get_logger(__name__)
 
@@ -40,8 +41,19 @@ class CodeIntelligence:
             return content[:self.max_chars] + "\n\n[... content truncated for safety ...]"
         return content
 
-    def explain(self, content: str, question: str = "") -> str:
+    def _is_safe(self, content: str, filename: str) -> bool:
+        """Check if content is safe to send to LLM."""
+        is_safe, _ = scan_content_safe(content, source_hint=filename)
+        return is_safe
+
+    def _safety_message(self) -> str:
+        return "This file appears to contain sensitive credentials. Content was not sent to the LLM. Please remove secrets before requesting code analysis."
+
+    def explain(self, content: str, question: str = "", filename: str = "") -> str:
         """Explain code logic and flow."""
+        if not self._is_safe(content, filename):
+            return self._safety_message()
+            
         content = self._prepare(content)
         raw = self.ai._call_ollama(
             model=config.ollama_reason_model,
@@ -50,8 +62,14 @@ class CodeIntelligence:
         )
         return raw or "AI failed to generate an explanation. Please try again."
 
-    def refactor(self, content: str, instruction: str) -> Dict[str, str]:
+    def refactor(self, content: str, instruction: str, filename: str = "") -> Dict[str, str]:
         """Suggest refactored code with reasoning."""
+        if not self._is_safe(content, filename):
+            return {
+                "reasoning": self._safety_message(),
+                "refactored_code": "# Content redacted for safety."
+            }
+            
         content = self._prepare(content)
         raw = self.ai._call_ollama(
             model=config.ollama_reason_model,
@@ -64,8 +82,15 @@ class CodeIntelligence:
             "refactored_code": content
         }
 
-    def debug(self, content: str, error: str) -> Dict[str, Any]:
+    def debug(self, content: str, error: str, filename: str = "") -> Dict[str, Any]:
         """Diagnose bugs based on code and error logs."""
+        if not self._is_safe(content, filename):
+            return {
+                "diagnosis": self._safety_message(),
+                "fix": "Please remove credentials and try again.",
+                "confidence": 0.0
+            }
+            
         content = self._prepare(content)
         raw = self.ai._call_ollama(
             model=config.ollama_reason_model,
@@ -79,8 +104,15 @@ class CodeIntelligence:
             "confidence": 0.0
         }
 
-    def review(self, content: str) -> Dict[str, Any]:
+    def review(self, content: str, filename: str = "") -> Dict[str, Any]:
         """Perform a qualitative code review."""
+        if not self._is_safe(content, filename):
+            return {
+                "issues": [self._safety_message()],
+                "suggestions": [],
+                "quality_score": 0
+            }
+            
         content = self._prepare(content)
         raw = self.ai._call_ollama(
             model=config.ollama_reason_model,
