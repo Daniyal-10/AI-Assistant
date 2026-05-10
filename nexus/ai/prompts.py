@@ -1,10 +1,13 @@
 """
 nexus/ai/prompts.py
+───────────────────
 All prompt templates. Never scatter prompts across files.
+classify_error and _FIX_STRATEGY_INSTRUCTIONS have moved to nexus/repair/classifier.py.
 """
 import json
 from typing import Any, Dict, List, Optional
 
+from nexus.repair.classifier import get_strategy_instruction
 from nexus.utils.config import config
 
 
@@ -124,18 +127,24 @@ RULES:
 def build_plan_prompt(
     user_input: str,
     context_summary: str = "",
-    project_snapshot: Optional[Any] = None
+    project_snapshot: Optional[Any] = None,
 ) -> str:
     ctx = f"\n{context_summary}\n" if context_summary else ""
-    
+
     prj = ""
     if project_snapshot:
-        files_list = "\n".join(f"  - {f}" for f in project_snapshot.structure)
+        files_list = "\n".join(
+            f"  - {f}" for f in project_snapshot.structure[:50]
+        )
+        if project_snapshot.total_files > 50:
+            files_list += f"\n  ... and {project_snapshot.total_files - 50} more files"
         prj = (
-            f"\n--- PROJECT STRUCTURE ({project_snapshot.root}) ---\n"
-            f"Languages: {', '.join(project_snapshot.languages)}\n"
+            f"\n--- EXISTING PROJECT FILES (do not regenerate these) ---\n"
+            f"Root: {project_snapshot.root}\n"
+            f"Languages detected: {', '.join(project_snapshot.languages)}\n"
+            f"Total files: {project_snapshot.total_files}\n"
             f"Files:\n{files_list}\n"
-            f"-----------------------------------------------\n"
+            f"-------------------------------------------------------\n"
         )
 
     return (
@@ -177,6 +186,7 @@ def build_fix_prompt(
     semantic_reason: Optional[str] = None,
     semantic_issues: Optional[List[str]] = None,
     error_category: str = "UNKNOWN",
+    strategy_brief: str = "",
 ) -> str:
     attempt_history = attempt_history or []
 
@@ -196,20 +206,25 @@ def build_fix_prompt(
     if semantic_reason:
         semantic_parts.append(f"SEMANTIC ISSUE: {semantic_reason}")
     if semantic_issues:
-        semantic_parts.append("SPECIFIC ISSUES:\n" + "\n".join(f"  - {i}" for i in semantic_issues))
+        semantic_parts.append(
+            "SPECIFIC ISSUES:\n" + "\n".join(f"  - {i}" for i in semantic_issues)
+        )
+
+    strategy_instruction = get_strategy_instruction(error_category)
 
     return (
         f"FIX ITERATION {iteration}/{config.max_fix_iterations}\n\n"
         f"{history_text}\n\n"
         f"PLAN:\n{json.dumps(plan, indent=2)}\n\n"
-        f"WORKSPACE FILES:\n{file_summary}\n\n"
+        f"WORKSPACE FILES (targeted):\n{file_summary}\n\n"
         f"FILE CONTENTS:\n{json.dumps(current_files, indent=2)}\n\n"
         f"STDOUT:\n{stdout[:600]}\n\n"
         f"STDERR (this is the actual error):\n{stderr[-1000:]}\n\n"
         f"ERROR SUMMARY:\n{error}\n\n"
         f"{chr(10).join(semantic_parts)}\n\n"
         f"ERROR CATEGORY: {error_category}\n\n"
-        f"{_FIX_STRATEGY_INSTRUCTIONS.get(error_category, _FIX_STRATEGY_INSTRUCTIONS['UNKNOWN'])}\n\n"
+        f"{('REPAIR BRIEF: ' + strategy_brief + chr(10) + chr(10)) if strategy_brief else ''}"
+        f"{strategy_instruction}\n\n"
         "GLOBAL RULES:\n"
         "1. Do NOT repeat any fix listed in PREVIOUS ATTEMPTS above\n"
         "2. Return ONLY files that changed\n"
@@ -218,110 +233,6 @@ def build_fix_prompt(
         "5. Tests must use pytest, never unittest directly\n"
         "Return ONLY changed files with COMPLETE content."
     )
-
-
-def classify_error(stderr: str, stdout: str) -> str:
-    """
-    Classify the failure type from stderr/stdout into a fix strategy category.
-    Returns a string tag used to inject targeted instructions into the fix prompt.
-    """
-    combined = (stderr + stdout).lower()
-
-    if "modulenotfounderror" in combined or "no module named" in combined:
-        return "MODULE_NOT_FOUND"
-    if "importerror" in combined:
-        return "IMPORT_ERROR"
-    if "syntaxerror" in combined or "was never closed" in combined:
-        return "SYNTAX_ERROR"
-    if "assertionerror" in combined or "assert" in combined:
-        return "ASSERTION_ERROR"
-    if "filenotfounderror" in combined or "no such file" in combined:
-        return "FILE_NOT_FOUND"
-    if (
-        "socket" in combined
-        or "getaddrinfo" in combined
-        or "connectionrefused" in combined
-        or "network" in combined
-        or "urlopen error" in combined
-    ):
-        return "NETWORK_IN_TEST"
-    if "typeerror" in combined:
-        return "TYPE_ERROR"
-    if "nameerror" in combined:
-        return "NAME_ERROR"
-    return "UNKNOWN"
-
-
-# Strategy-specific fix instructions injected into the fix prompt
-_FIX_STRATEGY_INSTRUCTIONS = {
-    "MODULE_NOT_FOUND": (
-        "STRATEGY: MODULE_NOT_FOUND\n"
-        "The import is failing because a third-party module is not installed.\n"
-        "ACTION: Rewrite the code to use Python stdlib equivalents:\n"
-        "  - pandas → csv, pathlib, collections\n"
-        "  - requests → urllib.request\n"
-        "  - numpy → math, statistics\n"
-        "Only add the module to requirements.txt if stdlib CANNOT replace it."
-    ),
-    "IMPORT_ERROR": (
-        "STRATEGY: IMPORT_ERROR\n"
-        "A local module import is failing.\n"
-        "ACTION: Fix the import path. Check that the module file exists "
-        "in the workspace and that the import statement matches the filename exactly.\n"
-        "Do NOT change module logic — only fix the import statement."
-    ),
-    "SYNTAX_ERROR": (
-        "STRATEGY: SYNTAX_ERROR\n"
-        "The file has a syntax error and cannot be parsed.\n"
-        "ACTION: Fix ONLY the syntax error on the reported line. "
-        "Do not refactor or restructure the file."
-    ),
-    "ASSERTION_ERROR": (
-        "STRATEGY: ASSERTION_ERROR\n"
-        "A test assertion is failing — either the logic is wrong or the test expectation is wrong.\n"
-        "ACTION:\n"
-        "  1. Read the STDOUT carefully — it shows the actual vs expected values.\n"
-        "  2. If the source logic is correct, fix the TEST assertion to match reality.\n"
-        "  3. If the source logic is wrong, fix the SOURCE CODE.\n"
-        "  4. Do NOT mock away the logic being tested.\n"
-        "  EXAMPLE: If test asserts factorial(5) == 600 but actual is 120, "
-        "fix the test to assert == 120."
-    ),
-    "FILE_NOT_FOUND": (
-        "STRATEGY: FILE_NOT_FOUND\n"
-        "A required file is missing from the workspace.\n"
-        "ACTION: Generate the missing file with appropriate sample content. "
-        "Include it in fixed_files."
-    ),
-    "NETWORK_IN_TEST": (
-        "STRATEGY: NETWORK_IN_TEST\n"
-        "A test is making a real network call which is forbidden in the sandbox.\n"
-        "ACTION: Fix the TEST file to mock the network call using unittest.mock.patch.\n"
-        "Do NOT change the implementation logic.\n"
-        "Use this pattern:\n"
-        "  with patch('module.urllib.request.urlopen') as mock_url:\n"
-        "      mock_url.return_value.__enter__ = lambda s: s\n"
-        "      mock_url.return_value.read.return_value = b'expected_response'\n"
-        "      result = function_under_test()\n"
-        "      assert result == expected_value"
-    ),
-    "TYPE_ERROR": (
-        "STRATEGY: TYPE_ERROR\n"
-        "A function received the wrong type.\n"
-        "ACTION: Fix the type mismatch. Check the function signature and "
-        "the call site. Add type conversion if needed."
-    ),
-    "NAME_ERROR": (
-        "STRATEGY: NAME_ERROR\n"
-        "A variable or function name is referenced before definition.\n"
-        "ACTION: Define the variable or import the function before its first use."
-    ),
-    "UNKNOWN": (
-        "STRATEGY: UNKNOWN\n"
-        "Read STDERR carefully and apply the most targeted fix possible.\n"
-        "Do NOT change code that is unrelated to the error."
-    ),
-}
 
 
 SYSTEM_ROUTER = """You are NEXUS Intent Router.
@@ -362,7 +273,7 @@ def build_semantic_validation_prompt(task: str, code: str, output: str) -> str:
     )
 
 
-SYSTEM_CODE_EXPLAINER = """You are NEXUS Code Explainer. 
+SYSTEM_CODE_EXPLAINER = """You are NEXUS Code Explainer.
 Explain the provided code clearly and concisely.
 Focus on: logic flow, key dependencies, and potential side effects.
 If the code is ambiguous or you are uncertain, state it explicitly."""
@@ -402,8 +313,8 @@ def build_review_prompt(content: str) -> str:
     return f"CODE:\n{content}"
 
 
-SYSTEM_JARVIS = """You are NEXUS, a highly capable and precise developer assistant. 
-Your tone is calm, professional, and confident. 
+SYSTEM_JARVIS = """You are NEXUS, a highly capable and precise developer assistant.
+Your tone is calm, professional, and confident.
 
 RULES:
 1. Always acknowledge what you understood from the user's request before providing a response.

@@ -10,14 +10,13 @@ from unittest.mock import patch
 
 import pytest
 from nexus.core.context import SessionContext
-from nexus.utils.config import config
+from nexus.utils.config import test_config as nexus_test_config
 
 
 def test_context_history_bounds():
     """Verify that conversation and task histories are strictly bounded."""
     ctx = SessionContext()
 
-    # Fill conversation history beyond limit (20)
     for i in range(25):
         ctx.add_message("user", f"message {i}")
     
@@ -25,7 +24,6 @@ def test_context_history_bounds():
     assert ctx.conversation_history[0]["content"] == "message 5"
     assert ctx.conversation_history[-1]["content"] == "message 24"
 
-    # Fill task history beyond limit (10)
     for i in range(15):
         ctx.add_task_result(f"id-{i}", "summary", "TASK", "DONE")
     
@@ -47,23 +45,21 @@ def test_context_summary_generation():
     
     assert "Active Project Path: /workspace/project-a" in summary
     assert "abc123 [TASK]: DONE | Scraper built successfully" in summary
-    # Messages skip the last one (current prompt) in my implementation
     assert "USER: Hello" in summary
     assert "ASSISTANT: Hi! I am NEXUS." in summary
 
 
 def test_context_atomic_serialization(tmp_path):
     """Verify atomic JSON serialization to the sessions directory."""
-    # Mock workspace base to use a temp directory
-    test_workspace = tmp_path / "workspaces"
-    test_workspace.mkdir()
-    
-    with patch("nexus.utils.config.config.workspace_base", str(test_workspace)):
+    ws = tmp_path / "workspaces"
+    ws.mkdir(exist_ok=True)
+
+    with nexus_test_config(workspace_base=str(ws)):
         ctx = SessionContext(session_id="test-session")
         ctx.add_message("user", "persist this")
         ctx.save()
 
-        sessions_dir = tmp_path / "sessions"
+        sessions_dir = ws.parent / "sessions"
         session_file = sessions_dir / "session_test-session.json"
         
         assert session_file.exists()
@@ -77,16 +73,15 @@ def test_context_atomic_serialization(tmp_path):
 
 def test_context_save_failure_handling(tmp_path):
     """Verify that save failure doesn't crash and cleans up temp files."""
-    test_workspace = tmp_path / "workspaces"
-    test_workspace.mkdir()
+    ws = tmp_path / "workspaces"
+    ws.mkdir(exist_ok=True)
 
-    with patch("nexus.utils.config.config.workspace_base", str(test_workspace)):
+    with nexus_test_config(workspace_base=str(ws)):
         ctx = SessionContext(session_id="fail-test")
         
-        # Mock open to raise error
         with patch("builtins.open", side_effect=IOError("Permission denied")):
-            ctx.save() # Should not raise
+            ctx.save()  # Should not raise
             
-        sessions_dir = tmp_path / "sessions"
+        sessions_dir = ws.parent / "sessions"
         temp_file = sessions_dir / "session_fail-test.tmp"
         assert not temp_file.exists()

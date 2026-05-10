@@ -22,7 +22,6 @@ from nexus.ai.prompts import (
     SYSTEM_JARVIS,
     build_chat_prompt,
     build_fix_prompt,
-    classify_error,
     build_generation_prompt,
     build_plan_prompt,
     build_semantic_validation_prompt,
@@ -35,6 +34,14 @@ from nexus.core.exceptions import (
 )
 from nexus.utils.config import config
 from nexus.utils.logger import get_logger
+from nexus.ai.providers.ollama_provider import OllamaProvider
+from nexus.ai.providers.anthropic_provider import AnthropicProvider
+from nexus.repair.classifier import classify_error
+from nexus.repair.targeting import select_files_for_fix
+from nexus.repair.strategy import get_repair_strategy, is_terminal_error
+from nexus.planning.planner import PlanningEngine
+from nexus.context.assembler import ContextAssembler
+from nexus.skills.registry import SkillRegistry
 
 logger = get_logger(__name__)
 
@@ -201,8 +208,16 @@ class AIOrchestrator:
         )
         if result is None:
             raise TaskPlanningError("AI failed to produce a valid plan after retries.")
+        # Enrich plan with complexity analysis and feasibility checks
+        snapshot = getattr(context, "project_snapshot", None) if context else None
+        enriched = self._planner.enrich(result, user_input, snapshot)
+        if not enriched.feasibility_ok:
+            logger.warning(
+                "Plan has feasibility issues (%d) — proceeding with warnings",
+                len(enriched.feasibility_notes),
+            )
         logger.info("Plan generated: %s", result.get("description", ""))
-        return result
+        return enriched
 
     def generate_code(self, plan: Dict[str, Any], context: Optional[Any] = None) -> Dict[str, str]:
         logger.info(
@@ -239,6 +254,8 @@ class AIOrchestrator:
         error_category: str = "UNKNOWN",
     ) -> Optional[Dict[str, str]]:
         logger.info("Requesting fix (iteration %d)...", iteration)
+        strategy = get_repair_strategy(error_category, iteration, attempt_history)
+        logger.info("Repair approach: %s | brief: %s", strategy.approach.value, strategy.brief[:80])
         user_prompt = build_fix_prompt(
             plan=plan,
             current_files=current_files,
@@ -250,6 +267,7 @@ class AIOrchestrator:
             semantic_reason=semantic_reason,
             semantic_issues=semantic_issues,
             error_category=error_category,
+            strategy_brief=strategy.brief,
         )
 
         # Iteration 1: Strictly Local (Ollama)
@@ -329,3 +347,5 @@ class AIOrchestrator:
             user_prompt=build_chat_prompt(user_input, ctx_summary)
         )
         return raw or "I am listening, but I'm having trouble processing your request at the moment."
+
+# ── Sprint 1 additions ──

@@ -267,6 +267,8 @@ def test_config_validation_rejects_bad_values():
     object.__setattr__(bad_cfg, "ollama_reason_model", "llama3.1:8b")
     object.__setattr__(bad_cfg, "allowed_telegram_users", [])
     object.__setattr__(bad_cfg, "telegram_bot_token", "")
+    object.__setattr__(bad_cfg, "fallback_enabled", False)
+    object.__setattr__(bad_cfg, "anthropic_api_key", None)
 
     try:
         _validate_config(bad_cfg)
