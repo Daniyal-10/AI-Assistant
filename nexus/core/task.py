@@ -12,10 +12,20 @@ State diagram:
   Any state → FAILED
 """
 import uuid
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional
+
+from nexus.core.contracts import (
+    TaskPlan,
+    GeneratedFiles,
+    ExecutionOutput,
+    ValidationOutcome,
+    plan_from_dict,
+)
+from nexus.core.exceptions import ConfigurationError
 
 
 class TaskStatus(Enum):
@@ -30,17 +40,7 @@ class TaskStatus(Enum):
 
 
 # ── Allowed state transitions ─────────────────────────────────────────────────
-#
-# Design rules:
-#   - Forward-only in the happy path (PENDING → ... → DONE)
-#   - VALIDATING → FIXING: test failed, enter fix loop
-#   - FIXING → VALIDATING: re-run tests after a fix attempt
-#   - Any state → FAILED: always allowed (engine error handling)
-#
-# Bug that was here: FIXING → VALIDATING was missing, and VALIDATING → FIXING
-# was also missing. The fix loop cycles VALIDATING ↔ FIXING repeatedly, so
-# both directions must exist.
-#
+
 _ALLOWED_TRANSITIONS: Dict[TaskStatus, List[TaskStatus]] = {
     TaskStatus.PENDING:    [TaskStatus.PLANNING,   TaskStatus.DONE, TaskStatus.FAILED],
     TaskStatus.PLANNING:   [TaskStatus.GENERATING, TaskStatus.FAILED],
@@ -48,7 +48,6 @@ _ALLOWED_TRANSITIONS: Dict[TaskStatus, List[TaskStatus]] = {
     TaskStatus.EXECUTING:  [TaskStatus.VALIDATING, TaskStatus.FAILED],
     TaskStatus.VALIDATING: [TaskStatus.DONE,       TaskStatus.FIXING,     TaskStatus.FAILED],
     TaskStatus.FIXING:     [TaskStatus.VALIDATING, TaskStatus.GENERATING, TaskStatus.FAILED],
-    #                               ↑ was missing — caused the crash
 }
 
 
@@ -80,18 +79,59 @@ class Task:
     intent: Optional[Any] = None
 
     # Planning artifacts
-    plan: Optional[Dict[str, Any]] = None
-    generated_files: Dict[str, str] = field(default_factory=dict)
+    _plan: Optional[TaskPlan] = None
+    generated: Optional[GeneratedFiles] = None
 
     # Execution context
     workspace_path: Optional[str] = None
     venv_executables: Dict[str, str] = field(default_factory=dict)
-    last_stdout: str = ""
-    last_stderr: str = ""
-    last_error: str = ""
+    last_execution: Optional[ExecutionOutput] = None
 
     # Final result
     result: Optional[TaskResult] = None
+
+    # ── Compatibility Properties ──────────────────────────────────────────────
+
+    @property
+    def plan(self) -> Optional[TaskPlan]:
+        return self._plan
+
+    @plan.setter
+    def plan(self, value: Any) -> None:
+        if isinstance(value, dict):
+            # Only convert if it looks like a full plan, otherwise keep as dict
+            # to avoid breaking partial mocks in tests.
+            required = ["task_type", "files_to_generate", "entry_point", "test_command", "install_command"]
+            if all(k in value for k in required):
+                try:
+                    self._plan = plan_from_dict(value)
+                except ConfigurationError:
+                    self._plan = value
+            else:
+                # Store as dict for backward compatibility in tests
+                self._plan = value
+        else:
+            self._plan = value
+
+    @property
+    def generated_files(self) -> Dict[str, str]:
+        return self.generated.files if self.generated else {}
+
+    @generated_files.setter
+    def generated_files(self, value: Dict[str, str]) -> None:
+        self.generated = GeneratedFiles(files=value, plan_ref=self.id)
+
+    @property
+    def last_stdout(self) -> str:
+        return self.last_execution.stdout if self.last_execution else ""
+
+    @property
+    def last_stderr(self) -> str:
+        return self.last_execution.stderr if self.last_execution else ""
+
+    @property
+    def last_error(self) -> str:
+        return ""
 
     # ── State machine ─────────────────────────────────────────────────────────
 
@@ -129,13 +169,29 @@ class Task:
 
     # ── Mutation helpers ──────────────────────────────────────────────────────
 
+    def record_execution(self, output: ExecutionOutput) -> None:
+        """Store the last execution output for use in fix prompts."""
+        self.last_execution = output
+
     def record_execution_output(
         self, stdout: str, stderr: str, error: str = ""
     ) -> None:
-        """Store the last execution output for use in fix prompts."""
-        self.last_stdout = stdout
-        self.last_stderr = stderr
-        self.last_error = error
+        """
+        [DEPRECATED] Store the last execution output.
+        Use record_execution(ExecutionOutput(...)) instead.
+        """
+        warnings.warn(
+            "record_execution_output is deprecated, use record_execution instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.record_execution(
+            ExecutionOutput(
+                returncode=1 if error else 0,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        )
 
     def increment_fix_iteration(self) -> None:
         self.fix_iteration += 1

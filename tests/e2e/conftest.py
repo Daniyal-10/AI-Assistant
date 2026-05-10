@@ -7,18 +7,25 @@ import os
 import shutil
 import pytest
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from nexus.core.engine import TaskEngine
 from nexus.core.context import SessionContext
 
 
 @pytest.fixture
 def safe_workspace(tmp_path):
-    """Override workspace_base to a temporary directory to avoid polluting .nexus/."""
-    # Resolve to absolute path to ensure boundary checks pass
+    """
+    Provides a clean temporary workspace for E2E tests.
+    
+    Config isolation is automatically handled by the root conftest.py 
+    isolated_config fixture (autouse=True), which runs before this fixture.
+    """
     ws_root = tmp_path.resolve()
-    with patch("nexus.utils.config.config.workspace_base", str(ws_root)):
-        yield ws_root
+    yield ws_root
+    
+    # Cleanup: TaskEngine creates subdirectories in workspace_base
+    if os.path.exists(str(ws_root)):
+        shutil.rmtree(str(ws_root), ignore_errors=True)
 
 
 @pytest.fixture

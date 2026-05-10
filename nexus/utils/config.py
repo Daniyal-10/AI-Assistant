@@ -4,6 +4,9 @@ Never hardcode values here.
 """
 import os
 import sys
+import threading
+import contextlib
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Optional
 from dotenv import load_dotenv
@@ -132,6 +135,111 @@ def _validate_config(cfg: NexusConfig) -> None:
         sys.exit(1)
 
 
-# Singleton — import this everywhere
-config = NexusConfig()
-_validate_config(config)
+# ── Config registry ───────────────────────────────────────────────────────────
+
+_config_instance: Optional[NexusConfig] = None
+_config_lock = threading.Lock()
+
+
+def get_config() -> NexusConfig:
+    """
+    Return the global NexusConfig singleton, creating and validating it 
+    on first call. Thread-safe. Safe to call at import time from any module.
+    
+    This replaces the old module-level `config` singleton.
+    Import pattern:
+        from nexus.utils.config import get_config
+        cfg = get_config()
+    """
+    global _config_instance
+    if _config_instance is not None:
+        return _config_instance
+    with _config_lock:
+        if _config_instance is None:
+            instance = NexusConfig()
+            _validate_config(instance)
+            _config_instance = instance
+    return _config_instance
+
+
+def override_config(cfg: NexusConfig) -> None:
+    """
+    Replace the global config instance. 
+    USE ONLY IN TESTS via the test_config() context manager.
+    Never call this directly in production code.
+    """
+    global _config_instance
+    with _config_lock:
+        _config_instance = cfg
+
+
+def reset_config() -> None:
+    """
+    Clear the cached config instance, forcing re-creation on next get_config() call.
+    USE ONLY IN TESTS.
+    """
+    global _config_instance
+    with _config_lock:
+        _config_instance = None
+
+
+@contextlib.contextmanager
+def test_config(**overrides):
+    """
+    Context manager for test isolation. Creates a NexusConfig with 
+    provided overrides, bypasses validation, and restores original 
+    config on exit.
+    
+    Usage in tests:
+        from nexus.utils.config import test_config
+        
+        with test_config(workspace_base="/tmp/test", exec_timeout=5):
+            engine = TaskEngine()
+            # engine uses the test config
+        # original config restored here
+    
+    Args:
+        **overrides: NexusConfig field names and their test values.
+    """
+    original = _config_instance
+    try:
+        test_cfg = NexusConfig()
+        for field_name, value in overrides.items():
+            if not hasattr(test_cfg, field_name):
+                raise ValueError(
+                    f"test_config: '{field_name}' is not a valid NexusConfig field. "
+                    f"Valid fields: {[f.name for f in dataclasses.fields(test_cfg)]}"
+                )
+            object.__setattr__(test_cfg, field_name, value)
+        override_config(test_cfg)
+        yield test_cfg
+    finally:
+        override_config(original) if original is not None else reset_config()
+
+
+# ── Backward compatibility ────────────────────────────────────────────────────
+# The old pattern was: from nexus.utils.config import config
+# New pattern is:      from nexus.utils.config import get_config; cfg = get_config()
+# This alias allows existing code to keep working during the migration.
+# It is evaluated lazily — accessing `config` triggers get_config() on first use.
+
+class _ConfigProxy:
+    """
+    Lazy proxy for the old `config` module attribute.
+    Accessing any attribute on this proxy calls get_config() first.
+    This means the old pattern `from nexus.utils.config import config`
+    still works and gets the real validated config, but does NOT 
+    run validation at import time.
+    """
+    def __getattr__(self, name: str):
+        return getattr(get_config(), name)
+    
+    def __setattr__(self, name: str, value):
+        # Allow setting on the underlying instance for monkeypatching in tests
+        cfg = get_config()
+        object.__setattr__(cfg, name, value)
+    
+    def __repr__(self):
+        return f"ConfigProxy({get_config()!r})"
+
+config = _ConfigProxy()

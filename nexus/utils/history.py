@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from nexus.utils.config import config
+from nexus.utils.config import get_config
 from nexus.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -39,7 +39,7 @@ class TaskHistory:
     Queries scan from the end of the file for recent-first results.
     """
     def __init__(self):
-        self.history_dir = Path(config.workspace_base).parent / "history"
+        self.history_dir = Path(get_config().workspace_base).parent / "history"
         self.history_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_current_file(self) -> Path:
