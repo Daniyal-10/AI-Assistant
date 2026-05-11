@@ -30,6 +30,7 @@ from nexus.executor.validator import build_error_context, validate_result, Valid
 from nexus.executor.workspace import Workspace
 from nexus.utils.config import config
 from nexus.utils.history import TaskHistory
+from nexus.memory.manager import get_memory
 from nexus.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -52,6 +53,7 @@ class TaskEngine:
         self.ai = AIOrchestrator()
         self.context = context
         self.history = TaskHistory()
+        self.memory  = get_memory()
         self.code_intel = CodeIntelligence(self.ai)
         self._executor = get_executor()
         logger.info("TaskEngine initialized with %s", self._executor.__class__.__name__)
@@ -73,6 +75,24 @@ class TaskEngine:
     # ══════════════════════════════════════════════════════════════════════════
 
     def run(self, user_input: str, intent_result: Any = None) -> Any:
+        # ── Input guard: oversized input defaults to CHAT, no LLM call ────────
+        MAX_INPUT_CHARS = 8000
+        if len(user_input) > MAX_INPUT_CHARS:
+            logger.warning(
+                "Input too long (%d chars) — truncating to %d and defaulting to CHAT",
+                len(user_input), MAX_INPUT_CHARS,
+            )
+            user_input = user_input[:MAX_INPUT_CHARS]
+            # Skip routing — oversized inputs are never task requests
+            if intent_result is None:
+                from nexus.ai.router import IntentResult, IntentType
+                intent_result = IntentResult(
+                    intent=IntentType.CHAT,
+                    confidence=1.0,
+                    reasoning="Input exceeded maximum length — defaulted to CHAT",
+                    raw_input=user_input,
+                )
+
         task = Task(raw_input=user_input)
 
         logger.info("=" * 60)
@@ -88,9 +108,16 @@ class TaskEngine:
                 intent_result = router.route(task.raw_input)
 
             _intent = intent_result.intent
-            intent_val = (
-                _intent.value if isinstance(_intent, IntentType) else str(_intent).upper()
-            )
+            # Normalize intent to string safely — handles IntentType enum,
+            # plain string (from mocks), and any duck-typed object
+            if isinstance(_intent, IntentType):
+                intent_val = _intent.value
+            elif isinstance(_intent, str):
+                intent_val = _intent.upper()
+            elif hasattr(_intent, "value"):
+                intent_val = str(_intent.value).upper()
+            else:
+                intent_val = str(_intent).upper()
             task.intent = intent_result
 
             if self.context:
@@ -99,6 +126,21 @@ class TaskEngine:
             # ── Non-task intents ────────────────────────────────────────────
             if intent_val != IntentType.TASK.value:
                 logger.info("Non-task intent detected: %s", intent_val)
+                # Normalize intent_result so _handle_non_task always gets
+                # a real IntentResult regardless of what the caller passed
+                from nexus.ai.router import IntentResult
+                if not isinstance(intent_result, IntentResult):
+                    try:
+                        _norm_intent = IntentType(intent_val)
+                    except ValueError:
+                        _norm_intent = IntentType.CHAT
+                    intent_result = IntentResult(
+                        intent=_norm_intent,
+                        confidence=1.0,
+                        reasoning="Normalized from mock/string",
+                        raw_input=task.raw_input,
+                    )
+                    task.intent = intent_result
                 res = self._handle_non_task(task, intent_result)
                 if self.context:
                     self.context.add_message("assistant", res.result.summary)
@@ -120,12 +162,15 @@ class TaskEngine:
 
             install_result = self._stage_install(task, workspace)
             if not validate_result(install_result, "install"):
-                error_ctx = build_error_context(
-                    validate_result(install_result, "install"), "install"
-                )
-                task.record_execution_output(
-                    install_result.stdout, install_result.stderr, error_ctx
-                )
+                install_vr = validate_result(install_result, "install")
+                error_ctx = build_error_context(install_vr, "install")
+                from nexus.core.contracts import ExecutionOutput
+                task.record_execution(ExecutionOutput(
+                    returncode=install_result.returncode,
+                    stdout=install_result.stdout,
+                    stderr=install_result.stderr,
+                    timed_out=install_result.timed_out,
+                ))
                 self._fix_loop(task, workspace, error_ctx)
                 return task
 
@@ -136,11 +181,13 @@ class TaskEngine:
                 self._stage_complete(task, workspace, iterations=task.fix_iteration)
             else:
                 error_ctx = build_error_context(vr, "test")
-                task.record_execution_output(
-                    vr.stage1_result.stdout,
-                    vr.stage1_result.stderr,
-                    error_ctx,
-                )
+                from nexus.core.contracts import ExecutionOutput
+                task.record_execution(ExecutionOutput(
+                    returncode=vr.stage1_result.returncode,
+                    stdout=vr.stage1_result.stdout,
+                    stderr=vr.stage1_result.stderr,
+                    timed_out=getattr(vr.stage1_result, "timed_out", False),
+                ))
                 if getattr(vr.stage1_result, "timed_out", False) or vr.stage1_result.returncode == -1:
                     self._fail_task(task, "Execution timed out — task killed (non-fixable)")
                     return task
@@ -183,6 +230,20 @@ class TaskEngine:
             self.history.record(
                 task,
                 self.context.session_id if self.context else "NO_SESSION",
+            )
+            # Persist to queryable memory store
+            _intent_str = (
+                task.intent.intent.value
+                if task.intent and hasattr(task.intent, 'intent')
+                else str(task.intent) if task.intent else 'UNKNOWN'
+            )
+            self.memory.record_execution(
+                session_id=self.context.session_id if self.context else 'NO_SESSION',
+                intent=_intent_str,
+                raw_input=task.raw_input,
+                status=task.status.name,
+                summary=task.result.summary if task.result else '',
+                fix_attempts=task.fix_iteration,
             )
 
             if task.status == TaskStatus.FAILED and workspace is not None:
@@ -285,7 +346,9 @@ class TaskEngine:
         error_ctx: str,
         last_vr: Any = None,
     ) -> None:
-        max_iters = config.max_fix_iterations
+        # Read once at loop entry — prevents mid-loop config changes from
+        # affecting iteration count, and ensures monkeypatching in tests works.
+        max_iters = int(config.max_fix_iterations)
         current_error = error_ctx
         current_vr = last_vr
         attempt_history: List[str] = []
@@ -352,11 +415,13 @@ class TaskEngine:
                 )
 
             current_error = build_error_context(current_vr, "test")
-            task.record_execution_output(
-                current_vr.stage1_result.stdout,
-                current_vr.stage1_result.stderr,
-                current_error,
-            )
+            from nexus.core.contracts import ExecutionOutput
+            task.record_execution(ExecutionOutput(
+                returncode=current_vr.stage1_result.returncode,
+                stdout=current_vr.stage1_result.stdout,
+                stderr=current_vr.stage1_result.stderr,
+                timed_out=getattr(current_vr.stage1_result, "timed_out", False),
+            ))
             attempt_history.append(
                 f"Iteration {i}: changed {list(fixed_files.keys())} — "
                 f"still failed: {current_vr.stage1_result.stderr[-400:]}"
@@ -630,6 +695,20 @@ class TaskEngine:
 
         task.transition(TaskStatus.DONE)
         return task
+
+
+    def _fail_task(self, task: "Task", reason: str) -> None:
+        """Mark task FAILED with human-readable reason. Safe from any pipeline state."""
+        try:
+            task.transition(TaskStatus.FAILED)
+        except Exception:
+            task.status = TaskStatus.FAILED
+        task.result = TaskResult(
+            success=False,
+            summary=reason,
+            iterations_used=task.fix_iteration,
+        )
+        logger.error("Task [%s] FAILED: %s", task.id, reason)
 
     def _shutdown_cleanup(self) -> None:
         try:

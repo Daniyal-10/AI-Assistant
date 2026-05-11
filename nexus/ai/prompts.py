@@ -160,10 +160,28 @@ def build_plan_prompt(
     )
 
 
-def build_generation_prompt(plan: dict, context_summary: str = "") -> str:
+def build_generation_prompt(
+    plan: dict,
+    context_summary: str = "",
+    scaffold: Optional[Dict[str, str]] = None,
+) -> str:
     ctx = f"\n{context_summary}\n" if context_summary else ""
+
+    scaffold_block = ""
+    if scaffold:
+        scaffold_lines = ["\n--- SKILL SCAFFOLD (validated starting point) ---"]
+        scaffold_lines.append(
+            "These are pre-validated file templates. "
+            "Use them as a structural foundation and fill in the task-specific logic. "
+            "You MUST return ALL files listed in the plan, not just the scaffold files."
+        )
+        for fname, content in scaffold.items():
+            scaffold_lines.append(f"\n# {fname}\n{content}")
+        scaffold_lines.append("--- END SCAFFOLD ---\n")
+        scaffold_block = "\n".join(scaffold_lines)
+
     return (
-        f"{ctx}PLAN:\n"
+        f"{ctx}{scaffold_block}PLAN:\n"
         f"{json.dumps(plan, indent=2)}\n\n"
         "Generate ALL required files.\n"
         "- Use stdlib (csv, pathlib, os, json, urllib) instead of pandas/requests for simple tasks\n"
@@ -171,7 +189,8 @@ def build_generation_prompt(plan: dict, context_summary: str = "") -> str:
         "- If your code reads a file, generate a sample version of that file\n"
         "- ALWAYS write a pytest test file — tests must NEVER make real network calls\n"
         "- For API functions, mock HTTP calls in tests using unittest.mock.patch\n"
-        "- Every file must have complete, non-empty content"
+        "- Every file must have complete, non-empty content\n"
+        "- If a SKILL SCAFFOLD is provided above, use it as your structural base"
     )
 
 

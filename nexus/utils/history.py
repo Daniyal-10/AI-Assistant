@@ -57,19 +57,31 @@ class TaskHistory:
             # Hard truncation at 500 chars for storage security/efficiency
             summary = summary[:500]
 
-            # Extract intent value safely
+            # Extract intent value safely — handles IntentResult, IntentType, or raw str
             intent_val = "UNKNOWN"
             if hasattr(task, "intent") and task.intent:
-                if hasattr(task.intent, "intent"):
-                    intent_val = task.intent.intent.value
-                elif hasattr(task.intent, "value"):
-                    intent_val = task.intent.value
+                raw = task.intent
+                # IntentResult dataclass: has .intent attribute which is IntentType enum
+                if hasattr(raw, "intent") and hasattr(raw.intent, "value"):
+                    intent_val = raw.intent.value
+                # IntentType enum directly
+                elif hasattr(raw, "value") and isinstance(raw.value, str):
+                    intent_val = raw.value
+                # Already a plain string
+                elif isinstance(raw, str):
+                    intent_val = raw
+                else:
+                    intent_val = str(raw)
 
             record = TaskRecord(
                 session_id=session_id,
                 raw_input=task.raw_input,
                 intent=intent_val,
-                plan_summary=task.plan.get("description", "") if hasattr(task, "plan") and task.plan else "",
+                plan_summary=(
+                    task.plan.get("description", "")
+                    if hasattr(task, "plan") and task.plan and hasattr(task.plan, "get")
+                    else ""
+                ),
                 execution_status=task.status.name,
                 semantic_verdict=getattr(task.result, "semantic_verdict", "NOT_CHECKED") if hasattr(task, "result") and task.result else "NOT_CHECKED",
                 fix_attempts=getattr(task, "fix_iteration", 0),

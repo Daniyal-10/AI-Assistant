@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from nexus.executor.workspace import ProjectScanner, ProjectSnapshot
+from nexus.memory.manager import get_memory
 from nexus.utils.config import config
 from nexus.utils.logger import get_logger
 
@@ -165,6 +166,15 @@ class SessionContext:
                     content = content[:147] + "..."
                 lines.append(f"  {m['role'].upper()}: {content}")
 
+        # Persistent memory block
+        try:
+            mem_block = get_memory().build_memory_context(
+                project_path=self.active_project
+            )
+            if mem_block:
+                lines.append("\n" + mem_block)
+        except Exception:
+            pass  # memory is non-critical
         lines.append("-----------------------")
         return "\n".join(lines)
 

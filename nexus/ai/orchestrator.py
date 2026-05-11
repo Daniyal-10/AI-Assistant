@@ -220,22 +220,45 @@ class AIOrchestrator:
         return enriched
 
     def generate_code(self, plan: Dict[str, Any], context: Optional[Any] = None) -> Dict[str, str]:
-        logger.info(
-            "Generating code for %d files...",
-            len(plan.get("files_to_generate", [])),
-        )
-        history = context.get_truncated_history(config.nexus_context_token_budget) if context else None
+        num_files = len(plan.get("files_to_generate", []))
+        description = plan.get("description", "")
+        task_type   = plan.get("task_type", "")
+        user_input  = plan.get("raw_input", description)
+
+        logger.info("Generating code for %d files (task_type=%s)...", num_files, task_type)
+
+        # ── Skill scaffold injection ──────────────────────────────────────────
+        scaffold: Dict[str, str] = {}
+        skill = self._skills.match(user_input, task_type)
+        if skill:
+            scaffold = self._skills.get_scaffold(skill, description)
+            logger.info(
+                "Skill scaffold injected: '%s' (%d template files)",
+                skill.name, len(scaffold),
+            )
+
+        history     = context.get_truncated_history(config.nexus_context_token_budget) if context else None
         ctx_summary = context.get_recent_context(history) if context else ""
+
         result = self._call_with_retry(
             model=self._code_model,
             system_prompt=SYSTEM_GENERATOR,
-            user_prompt=build_generation_prompt(plan, ctx_summary),
+            user_prompt=build_generation_prompt(plan, ctx_summary, scaffold=scaffold),
             validator_fn=validate_generation,
             normalize_fn=normalize_generation,
         )
         if result is None:
             raise TaskGenerationError("AI failed to generate valid code after retries.")
+
         files = result["files"]
+
+        # ── Merge: scaffold fills any gap the LLM left empty ─────────────────
+        # LLM output always wins; scaffold is only a fallback safety net
+        for fname, content in scaffold.items():
+            if fname not in files or not files[fname].strip():
+                logger.debug("Scaffold fallback used for '%s'", fname)
+                files[fname] = content
+
         logger.info("Generated %d files: %s", len(files), list(files.keys()))
         return files
 
