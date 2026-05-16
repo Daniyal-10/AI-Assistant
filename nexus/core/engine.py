@@ -241,11 +241,16 @@ class TaskEngine:
                 self.context.session_id if self.context else "NO_SESSION",
             )
             # Persist to queryable memory store
-            _intent_str = (
-                task.intent.intent.value
-                if task.intent and hasattr(task.intent, 'intent')
-                else str(task.intent) if task.intent else 'UNKNOWN'
-            )
+            _intent_str = "UNKNOWN"
+            if task.intent:
+                _raw = getattr(task.intent, "intent", task.intent)
+                if hasattr(_raw, "value"):
+                    _intent_str = _raw.value
+                elif isinstance(_raw, str):
+                    _intent_str = _raw.upper()
+                else:
+                    _intent_str = str(_raw).upper()
+
             self.memory.record_execution(
                 session_id=self.context.session_id if self.context else 'NO_SESSION',
                 intent=_intent_str,

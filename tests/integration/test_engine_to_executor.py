@@ -13,16 +13,14 @@ from nexus.core.task import TaskStatus
 
 
 @pytest.fixture
-def engine(tmp_path):
+def engine():
     """
     Real engine using a temporary workspace for sandbox testing.
     """
-    # Override config to use tmp_path
-    with patch("nexus.utils.config.config.workspace_base", str(tmp_path)):
-        ctx = SessionContext()
-        # Initialize engine
-        e = TaskEngine(ctx)
-        yield e
+    ctx = SessionContext()
+    # Initialize engine
+    e = TaskEngine(ctx)
+    yield e
 
 
 @pytest.mark.integration
@@ -88,26 +86,59 @@ def test_forbidden_code_is_blocked_before_execution(engine):
         task = engine.run(user_input, intent_res)
         
         assert task.status == TaskStatus.FAILED
-        assert "FAILED" in task.result.summary
+        assert task.result.success is False
+        assert "Security violation" in task.result.summary or \
+               "Forbidden" in task.result.summary or \
+               "blocked" in task.result.summary.lower()
 
 
 @pytest.mark.integration
 def test_failed_execution_triggers_fix_loop(engine):
-    """Verify that a runtime or syntax failure triggers the auto-fix loop."""
+    """Verify that a runtime failure triggers the auto-fix loop."""
     user_input = "Fix syntax"
     intent_res = IntentResult(IntentType.TASK, 1.0, "Task", user_input)
     
-    # Mocking code gen: first returns runtime error, then returns fix
-    engine.ai.generate_code = MagicMock(return_value={"main.py": "raise RuntimeError('intentional failure')"})
-    engine.ai.generate_fix = MagicMock(return_value={"main.py": "print('fixed')"})
+    plan = {
+        "task_type": "script",
+        "description": "Test",
+        "steps": [],
+        "files_to_generate": ["main.py"],
+        "entry_point": "main.py",
+        "test_command": "python3 main.py",
+        "install_command": "",
+    }
     
-    # Mock validator results for: 1. Install (PASS), 2. Test First Run (FAIL), 3. Test Fix Run (PASS)
-    install_pass = MagicMock(is_success=True, status="PASS")
-    test_fail = MagicMock(is_success=False, status="FAIL")
-    test_pass = MagicMock(is_success=True, status="PASS", semantic_verdict="CORRECT", semantic_issues=[])
+    fail_result = MagicMock(
+        returncode=1, stdout="", stderr="RuntimeError: intentional",
+        timed_out=False, security_blocked=False
+    )
+    pass_result = MagicMock(
+        returncode=0, stdout="fixed", stderr="",
+        timed_out=False, security_blocked=False
+    )
     
-    with patch.object(engine.ai, "generate_plan", return_value={"description": "Test", "steps": [], "test_command": "python3 main.py"}), \
-         patch("nexus.core.engine.validate_result", side_effect=[install_pass, test_fail, test_pass]):
+    fail_vr = MagicMock(
+        is_success=False, status="FAIL", semantic_verdict=None,
+        semantic_issues=[], semantic_reason=None,
+        stage1_result=fail_result
+    )
+    pass_vr = MagicMock(
+        is_success=True, status="PASS", semantic_verdict="CORRECT",
+        semantic_issues=[],
+        stage1_result=pass_result
+    )
+    
+    with patch.object(engine.ai, "generate_plan", return_value=plan), \
+         patch.object(engine.ai, "generate_code", 
+                      return_value={"main.py": "raise RuntimeError('intentional')"}), \
+         patch.object(engine.ai, "generate_fix",
+                      return_value={"main.py": "print('fixed')"}), \
+         patch("nexus.core.engine.validate_result",
+               side_effect=[
+                   MagicMock(is_success=True),  # install
+                   fail_vr,                      # first test run
+                   pass_vr,                      # after fix
+               ]):
         
         task = engine.run(user_input, intent_res)
         
@@ -122,20 +153,38 @@ def test_fix_loop_terminates_at_max_retries(engine):
     user_input = "Fail forever"
     intent_res = IntentResult(IntentType.TASK, 1.0, "Task", user_input)
     
-    # Persistent failure
-    files = {"main.py": "raise Exception('Fail')"}
+    plan = {
+        "task_type": "script",
+        "description": "Test",
+        "steps": [],
+        "files_to_generate": ["main.py"],
+        "entry_point": "main.py",
+        "test_command": "python3 main.py",
+        "install_command": "",
+    }
     
-    with patch.object(engine.ai, "generate_plan", return_value={"description": "Test", "steps": []}), \
-         patch.object(engine.ai, "generate_code", return_value=files), \
-         patch.object(engine.ai, "generate_fix", return_value=files), \
-         patch("nexus.core.engine.validate_result", return_value=MagicMock(
-             is_success=False, status="FAIL", 
-             stage1_result=MagicMock(returncode=1, stdout="", stderr="Error", timed_out=False),
-             semantic_verdict=None, semantic_issues=[]
-         )):
+    exec_result = MagicMock(
+        returncode=1, stdout="", stderr="AssertionError: always fails",
+        timed_out=False, security_blocked=False
+    )
+    fail_vr = MagicMock(
+        is_success=False, status="FAIL",
+        semantic_verdict=None, semantic_reason=None, semantic_issues=[],
+        stage1_result=exec_result
+    )
+    # Make security_blocked explicitly False on stage1_result
+    fail_vr.stage1_result.security_blocked = False
+    fail_vr.stage1_result.timed_out = False
+    
+    with patch.object(engine.ai, "generate_plan", return_value=plan), \
+         patch.object(engine.ai, "generate_code",
+                      return_value={"main.py": "assert False, 'always fails'"}), \
+         patch.object(engine.ai, "generate_fix",
+                      return_value={"main.py": "assert False, 'still fails'"}), \
+         patch("nexus.core.engine.validate_result",
+               return_value=fail_vr):
         
         task = engine.run(user_input, intent_res)
         
         assert task.status == TaskStatus.FAILED
         assert task.result.iterations_used >= 1
-        # No unhandled exception should reach here
