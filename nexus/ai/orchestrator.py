@@ -39,9 +39,6 @@ from nexus.ai.providers.anthropic_provider import AnthropicProvider
 from nexus.repair.classifier import classify_error
 from nexus.repair.targeting import select_files_for_fix
 from nexus.repair.strategy import get_repair_strategy, is_terminal_error
-from nexus.planning.planner import PlanningEngine
-from nexus.context.assembler import ContextAssembler
-from nexus.skills.registry import SkillRegistry
 
 logger = get_logger(__name__)
 
@@ -56,6 +53,12 @@ class AIOrchestrator:
         self._code_model = config.ollama_code_model
         self._reason_model = config.ollama_reason_model
         self._timeout = config.ollama_timeout
+        from nexus.planning.planner import PlanningEngine
+        from nexus.skills.registry import SkillRegistry
+        from nexus.context.assembler import ContextAssembler
+        self._planner = PlanningEngine()
+        self._skills = SkillRegistry()
+        self._assembler = ContextAssembler(token_budget=2000)
 
     def _call_ollama(
         self,
@@ -240,10 +243,31 @@ class AIOrchestrator:
         history     = context.get_truncated_history(config.nexus_context_token_budget) if context else None
         ctx_summary = context.get_recent_context(history) if context else ""
 
+        # ── Project context assembly ─────────────────────────────────────────
+        assembled_ctx = ""
+        if context and context.project_snapshot:
+            from nexus.executor.workspace import ProjectScanner
+            try:
+                scanner = ProjectScanner(context.project_snapshot.root)
+                assembled = self._assembler.assemble(
+                    user_input=user_input,
+                    project_snapshot=context.project_snapshot,
+                    scanner=scanner,
+                )
+                assembled_ctx = assembled.to_prompt_block()
+            except Exception as e:
+                logger.debug("Context assembly skipped: %s", e)
+
+        if assembled_ctx:
+            ctx_summary = assembled_ctx + "\n" + ctx_summary
+
+        # Ensure plan is serializable (handles EnrichedPlan object)
+        plan_dict = plan.to_dict() if hasattr(plan, "to_dict") else plan
+
         result = self._call_with_retry(
             model=self._code_model,
             system_prompt=SYSTEM_GENERATOR,
-            user_prompt=build_generation_prompt(plan, ctx_summary, scaffold=scaffold),
+            user_prompt=build_generation_prompt(plan_dict, ctx_summary, scaffold=scaffold),
             validator_fn=validate_generation,
             normalize_fn=normalize_generation,
         )
@@ -279,8 +303,12 @@ class AIOrchestrator:
         logger.info("Requesting fix (iteration %d)...", iteration)
         strategy = get_repair_strategy(error_category, iteration, attempt_history)
         logger.info("Repair approach: %s | brief: %s", strategy.approach.value, strategy.brief[:80])
+
+        # Ensure plan is serializable (handles EnrichedPlan object)
+        plan_dict = plan.to_dict() if hasattr(plan, "to_dict") else plan
+
         user_prompt = build_fix_prompt(
-            plan=plan,
+            plan=plan_dict,
             current_files=current_files,
             stdout=stdout,
             stderr=stderr,

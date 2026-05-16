@@ -44,6 +44,23 @@ class EnrichedPlan:
     feasibility_notes: List[str]    = field(default_factory=list)
 
     # Pass-through helpers so engine can treat this like a dict
+    def to_dict(self) -> dict:
+        """Convert to a JSON-serializable dict, including enrichment fields."""
+        res = self.raw_plan.copy()
+        res.update({
+            "_enrichment": {
+                "complexity":      self.complexity.value,
+                "category":        self.category.value,
+                "estimated_files": self.estimated_files,
+                "has_network":     self.has_network,
+                "has_file_io":     self.has_file_io,
+                "needs_deps":      self.needs_deps,
+                "feasibility_ok":  self.feasibility_ok,
+                "feasibility_notes": self.feasibility_notes,
+            }
+        })
+        return res
+
     def get(self, key: str, default=None):
         return self.raw_plan.get(key, default)
 

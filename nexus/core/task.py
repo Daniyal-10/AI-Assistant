@@ -98,6 +98,10 @@ class Task:
 
     @plan.setter
     def plan(self, value: Any) -> None:
+        from nexus.planning.schema import EnrichedPlan
+        if isinstance(value, EnrichedPlan):
+            self._plan = value
+            return
         if isinstance(value, dict):
             # Only convert if it looks like a full plan, otherwise keep as dict
             # to avoid breaking partial mocks in tests.

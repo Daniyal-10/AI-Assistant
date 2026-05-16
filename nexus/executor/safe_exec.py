@@ -224,17 +224,24 @@ def run_command(
 
     logger.info("Executing: %s (cwd=%s, timeout=%ds)", args, cwd, effective_timeout)
 
+    popen_kwargs = {
+        "cwd": cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "env": env,
+        "shell": False,
+        "text": True,
+    }
+
+    if os.name != "nt":
+        # Unix: create process group for full cleanup
+        popen_kwargs["preexec_fn"] = os.setsid
+    else:
+        # Windows: create new process group
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
     try:
-        proc = subprocess.Popen(
-            args,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            shell=False,
-            text=True,
-            preexec_fn=os.setsid  # 🔴 CRITICAL: creates process group for full cleanup
-        )
+        proc = subprocess.Popen(args, **popen_kwargs)
 
         try:
             stdout, stderr = proc.communicate(timeout=effective_timeout)
@@ -252,12 +259,16 @@ def run_command(
 
         except subprocess.TimeoutExpired:
             logger.warning(
-                "Command timed out after %ds. Killing entire process group.",
+                "Command timed out after %ds. Killing process group.",
                 effective_timeout,
             )
 
-            # 🔴 Kill entire process group to prevent zombie processes
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            if os.name != "nt":
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                # Windows: taskkill is reliable for group cleanup
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], 
+                               capture_output=True)
 
             try:
                 # Cleanup pipes and collect any remaining output
@@ -309,17 +320,22 @@ def create_task_venv(workspace_path: str) -> str:
     builder = _venv.EnvBuilder(with_pip=True, clear=False)
     builder.create(venv_path)
 
-    python_bin = os.path.join(venv_path, "bin", "python3")
+    if os.name == "nt":
+        python_bin = os.path.join(venv_path, "Scripts", "python.exe")
+        pip_bin = os.path.join(venv_path, "Scripts", "pip.exe")
+    else:
+        python_bin = os.path.join(venv_path, "bin", "python3")
+        pip_bin = os.path.join(venv_path, "bin", "pip")
+
     if not os.path.exists(python_bin):
         raise ExecutionError(
-            f"Venv creation failed — python3 not found at {python_bin}"
+            f"Venv creation failed — python executable not found at {python_bin}"
         )
 
     # Pre-install pytest into every task venv.
     # Tasks with no requirements.txt skip the install step entirely,
     # which means pytest would never be installed — causing
     # "Command not found" when the test runner tries to execute.
-    pip_bin = os.path.join(venv_path, "bin", "pip")
     logger.info("Pre-installing pytest into task venv...")
     result = subprocess.run(
         [pip_bin, "install", "pytest", "--quiet"],
@@ -339,11 +355,24 @@ def get_venv_executables(venv_path: str) -> dict:
     Return a dict of executable paths inside the venv.
     Engine uses these to override default commands.
     """
-    bin_dir = os.path.join(venv_path, "bin")
-    return {
-        "python3": os.path.join(bin_dir, "python3"),
-        "python":  os.path.join(bin_dir, "python3"),
-        "pip":     os.path.join(bin_dir, "pip"),
-        "pip3":    os.path.join(bin_dir, "pip3"),
-        "pytest":  os.path.join(bin_dir, "pytest"),
-    }
+    if os.name == "nt":
+        bin_dir = os.path.join(venv_path, "Scripts")
+        python_exe = os.path.join(bin_dir, "python.exe")
+        pip_exe = os.path.join(bin_dir, "pip.exe")
+        pytest_exe = os.path.join(bin_dir, "pytest.exe")
+        return {
+            "python3": python_exe,
+            "python":  python_exe,
+            "pip":     pip_exe,
+            "pip3":    pip_exe,
+            "pytest":  pytest_exe,
+        }
+    else:
+        bin_dir = os.path.join(venv_path, "bin")
+        return {
+            "python3": os.path.join(bin_dir, "python3"),
+            "python":  os.path.join(bin_dir, "python3"),
+            "pip":     os.path.join(bin_dir, "pip"),
+            "pip3":    os.path.join(bin_dir, "pip3"),
+            "pytest":  os.path.join(bin_dir, "pytest"),
+        }

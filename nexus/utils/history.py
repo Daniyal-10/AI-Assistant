@@ -5,6 +5,7 @@ Persistent Task History Store — records execution metadata in rotated JSONL fi
 """
 import json
 import uuid
+import dataclasses
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -150,7 +151,9 @@ class TaskHistory:
                 
                 try:
                     data = json.loads(line)
-                    record = TaskRecord(**data)
+                    valid_fields = {f.name for f in dataclasses.fields(TaskRecord)}
+                    safe_data = {k: v for k, v in data.items() if k in valid_fields}
+                    record = TaskRecord(**safe_data)
                     if filter_fn is None or filter_fn(record):
                         results.append(record)
                 except (json.JSONDecodeError, TypeError) as e:

@@ -51,6 +51,17 @@ class TaskEngine:
         import atexit
 
         self.ai = AIOrchestrator()
+        from nexus.ai.providers.ollama_provider import OllamaProvider
+        _ollama = OllamaProvider()
+        if not _ollama.is_available():
+            logger.warning(
+                "⚠️  Ollama is not reachable at %s. "
+                "Tasks requiring AI will fail. "
+                "Start Ollama with: ollama serve",
+                config.ollama_base_url,
+            )
+        else:
+            logger.info("✅ Ollama connection verified at %s", config.ollama_base_url)
         self.context = context
         self.history = TaskHistory()
         self.memory  = get_memory()
@@ -85,7 +96,6 @@ class TaskEngine:
             user_input = user_input[:MAX_INPUT_CHARS]
             # Skip routing — oversized inputs are never task requests
             if intent_result is None:
-                from nexus.ai.router import IntentResult, IntentType
                 intent_result = IntentResult(
                     intent=IntentType.CHAT,
                     confidence=1.0,
@@ -128,7 +138,6 @@ class TaskEngine:
                 logger.info("Non-task intent detected: %s", intent_val)
                 # Normalize intent_result so _handle_non_task always gets
                 # a real IntentResult regardless of what the caller passed
-                from nexus.ai.router import IntentResult
                 if not isinstance(intent_result, IntentResult):
                     try:
                         _norm_intent = IntentType(intent_val)
@@ -385,7 +394,8 @@ class TaskEngine:
                 attempt_history.append(f"Iteration {i}: AI returned no changes.")
                 continue
 
-            task.generated_files.update(fixed_files)
+            merged = {**task.generated_files, **fixed_files}
+            task.generated_files = merged
             workspace.update_files(fixed_files)
             self._inject_conftest_if_needed(workspace, task)
             self._normalize_test_command(task, workspace)

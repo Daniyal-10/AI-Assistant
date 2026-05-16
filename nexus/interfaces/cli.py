@@ -115,11 +115,10 @@ def run_single(task_input: str) -> int:
 
     context = SessionContext(warm_history=warm_payload)
     engine = TaskEngine(context=context)
-    task = Task(raw_input=task_input)
     context.add_message("user", task_input)
 
     try:
-        result_task = engine.run(task)
+        result_task = engine.run(task_input)
         print_result(result_task)
         context.save()
 
