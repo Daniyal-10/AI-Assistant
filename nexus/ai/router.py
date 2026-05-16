@@ -42,11 +42,24 @@ class IntentRouter:
         self.ai = orchestrator or AIOrchestrator()
         # Simple rule-based patterns for fast fallbacks
         self._rules = [
-            (r"^(hi|hello|hey|good morning|yo|greetings)\b", IntentType.CHAT),
-            (r"\b(who are you|what can you do|help|status|about)\b", IntentType.CHAT),
-            (r"\b(ls|cd|pwd|mkdir|rm|clean|workspace|system|info)\b", IntentType.SYSTEM),
-            (r"\b(explain|refactor|debug|review|analyze|what does this code do)\b", IntentType.CODE),
-            (r"\b(build|create|write a script|generate|automate|process|make)\b", IntentType.TASK),
+            # CHAT: greetings and meta-questions
+            (r"^(hi|hello|hey|good\s+morning|yo|greetings)\b", IntentType.CHAT),
+            (r"\b(who are you|what can you do|how are you|status|about nexus)\b", IntentType.CHAT),
+
+            # SYSTEM: direct workspace or filesystem commands
+            (r"\b(ls\b|cd\b|pwd\b|mkdir\b|rm\b|clean workspace|workspace status|system info)\b", IntentType.SYSTEM),
+
+            # TASK: creating or building NEW things that require code execution
+            (r"\bwrite\s+(a|an|the|me\s+a|me\s+an)\s+\w+", IntentType.TASK),
+            (r"\b(implement|develop)\b", IntentType.TASK),
+            (r"\b(build|create|generate|make)\s+(a\s+|an\s+|the\s+|me\s+a\s+|me\s+an\s+)?\w+", IntentType.TASK),
+            (r"\b(script|program|tool|application|api|service|cli|bot|module|library)\b.{0,40}\b(that|to|which|for)\b", IntentType.TASK),
+            (r"\b(automate|scrape|process\s+a|parse\s+a)\b", IntentType.TASK),
+
+            # CODE: reasoning about EXISTING code, no execution needed
+            (r"\b(explain|refactor|debug|review|analyze)\b", IntentType.CODE),
+            (r"\bwhat does (this|the)\s+(code|function|class|method|script)\b", IntentType.CODE),
+            (r"\b(why (is|does)|what is wrong with|how does)\b.{0,30}\b(code|function|class)\b", IntentType.CODE),
         ]
 
     def _sanitize(self, text: str) -> str:

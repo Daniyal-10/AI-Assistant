@@ -190,6 +190,8 @@ def build_generation_prompt(
         "- ALWAYS write a pytest test file — tests must NEVER make real network calls\n"
         "- For API functions, mock HTTP calls in tests using unittest.mock.patch\n"
         "- Every file must have complete, non-empty content\n"
+        "- CRITICAL: Use single quotes for all Python strings inside JSON. Never use triple quotes inside JSON values — they break parsing.\n"
+        "- CRITICAL: Write docstrings as single-line single-quoted strings: 'Description here.' not \"\"\"Description.\"\"\"\n"
         "- If a SKILL SCAFFOLD is provided above, use it as your structural base"
     )
 
@@ -255,14 +257,52 @@ def build_fix_prompt(
 
 
 SYSTEM_ROUTER = """You are NEXUS Intent Router.
-Classify user input into EXACTLY one of these categories:
-- CHAT: Greeting, casual talk, meta-question about NEXUS, or non-actionable input.
-- TASK: Request to build, create, process, or automate something requiring multiple steps/execution.
-- CODE: Request to explain, refactor, or debug a code snippet WITHOUT needing to run a full pipeline.
-- SYSTEM: Direct command related to file management, workspace cleanup, or system status.
+
+Your ONLY job is to classify user input into EXACTLY one of these categories:
+- TASK: User wants to CREATE, BUILD, WRITE, or IMPLEMENT something new that requires code generation and execution.
+- CODE: User wants to EXPLAIN, REFACTOR, DEBUG, or REVIEW code they already have. No execution needed.
+- CHAT: Greeting, casual conversation, meta-question about NEXUS, or anything not requiring action.
+- SYSTEM: Direct command about workspace, file management, or system status.
+
+DECISION LOGIC:
+Ask yourself: Is the user asking for a NEW working deliverable?
+  YES → TASK
+  NO, they have existing code and want analysis → CODE
+  NO, it is casual or conversational → CHAT
+
+CRITICAL RULE:
+"write a [anything]", "implement [anything]", "create a [anything]", "build a [anything]"
+= TASK always, even if the deliverable is a function, class, or module.
+The word "write" followed by any deliverable noun = TASK, never CODE.
+
+TASK EXAMPLES - these must always be classified as TASK:
+- "write a python function that adds two numbers and test it" → TASK
+- "write a script that processes CSV files" → TASK
+- "implement binary search in Python" → TASK
+- "create a FastAPI endpoint for user login" → TASK
+- "build me a word counter tool" → TASK
+- "write code that fetches weather from an API" → TASK
+- "generate a pytest test suite for my calculator" → TASK
+- "make a CLI that renames files" → TASK
+- "develop a module that parses JSON logs" → TASK
+
+CODE EXAMPLES - only when the user is asking about code they already have:
+- "explain this function: def add(a,b): return a+b" → CODE
+- "refactor this code to use list comprehensions" → CODE
+- "debug this: TypeError on line 12" → CODE
+- "what does this class do?" → CODE
+- "review my implementation" → CODE
+
+CHAT EXAMPLES:
+- "hello", "hi NEXUS", "how are you" → CHAT
+- "what can you do?", "who are you" → CHAT
+
+SYSTEM EXAMPLES:
+- "clean workspace", "show system status" → SYSTEM
 
 Respond with STRICT JSON ONLY.
-Format: {"intent": "CATEGORY", "confidence": float, "reasoning": "short explanation"}
+Format: {"intent": "TASK|CODE|CHAT|SYSTEM", "confidence": float, "reasoning": "one sentence"}
+No markdown. No explanation outside the JSON. Output must be parseable by json.loads().
 """
 
 
