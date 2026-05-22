@@ -69,7 +69,8 @@ def test_extremely_long_input_does_not_hang(engine):
     
     start_time = time.time()
     # Should be processed quickly (mostly truncation or rejection)
-    res = engine.run(payload)
+    with patch("nexus.ai.orchestrator.AIOrchestrator.generate_chat_response", return_value="Blocked"):
+        res = engine.run(payload)
     elapsed = time.time() - start_time
     
     assert elapsed < 5.0
