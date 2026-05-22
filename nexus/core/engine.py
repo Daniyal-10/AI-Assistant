@@ -24,6 +24,18 @@ from nexus.core.exceptions import (
     TaskPlanningError,
 )
 from nexus.core.task import Task, TaskResult, TaskStatus
+from nexus.core.events import (
+    EventBus,
+    TaskStartedEvent,
+    TaskFinishedEvent,
+    PipelineStageStartedEvent,
+    PipelineStageFinishedEvent,
+    RepairLoopStartedEvent,
+    RepairIterationStartedEvent,
+    RepairIterationFinishedEvent,
+    RepairLoopFinishedEvent,
+    NexusEvent,
+)
 from nexus.executor.safe_exec import ExecResult, create_task_venv, get_venv_executables, run_command
 from nexus.executor.executor_factory import get_executor
 from nexus.executor.validator import build_error_context, validate_result, ValidationResult
@@ -69,6 +81,19 @@ class TaskEngine:
         self._executor = get_executor()
         logger.info("TaskEngine initialized with %s", self._executor.__class__.__name__)
 
+        self.event_bus = EventBus()
+        self.event_history = []
+
+        # Register default logging subscriber
+        def _log_event(event: NexusEvent) -> None:
+            logger.info("[EventBus] Emitted %s: %s", event.__class__.__name__, event.to_dict())
+        self.event_bus.subscribe(NexusEvent, _log_event)
+
+        # Register default memory subscriber
+        def _record_event(event: NexusEvent) -> None:
+            self.event_history.append(event)
+        self.event_bus.subscribe(NexusEvent, _record_event)
+
         try:
             from nexus.executor.docker_exec import cleanup_orphaned_containers, is_docker_available
             if is_docker_available():
@@ -104,6 +129,7 @@ class TaskEngine:
                 )
 
         task = Task(raw_input=user_input)
+        self.event_bus.emit(TaskStartedEvent(task_id=task.id, raw_input=task.raw_input))
 
         logger.info("=" * 60)
         logger.info("Starting task [%s]: %s", task.id, task.raw_input[:60])
@@ -268,6 +294,13 @@ class TaskEngine:
                         "Workspace cleanup failed for task %s", task.id
                     )
 
+            self.event_bus.emit(TaskFinishedEvent(
+                task_id=task.id,
+                success=task.result.success if task.result else False,
+                summary=task.result.summary if task.result else "",
+                status=task.status.name
+            ))
+
         return task
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -281,9 +314,16 @@ class TaskEngine:
         Raises TaskPlanningError on failure.
         """
         task.transition(TaskStatus.PLANNING)
-        plan = self.ai.generate_plan(task.raw_input, context=self.context)
-        task.plan = plan
-        logger.info("Plan stage complete: %s", plan.get("description", ""))
+        stage_name = task.status.name
+        self.event_bus.emit(PipelineStageStartedEvent(task_id=task.id, stage=stage_name))
+        try:
+            plan = self.ai.generate_plan(task.raw_input, context=self.context)
+            task.plan = plan
+            logger.info("Plan stage complete: %s", plan.get("description", ""))
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status="SUCCESS"))
+        except Exception:
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status="FAILED"))
+            raise
 
     def _stage_generate(self, task: Task, workspace: Workspace) -> None:
         """
@@ -292,14 +332,21 @@ class TaskEngine:
         Raises TaskGenerationError on failure.
         """
         task.transition(TaskStatus.GENERATING)
-        files = self.ai.generate_code(task.plan, context=self.context)
-        task.generated_files = files
-        workspace.write_files(files)
-        self._inject_conftest_if_needed(workspace, task)
-        self._normalize_test_command(task, workspace)
-        logger.info(
-            "Generate stage complete: %d files written", len(files)
-        )
+        stage_name = task.status.name
+        self.event_bus.emit(PipelineStageStartedEvent(task_id=task.id, stage=stage_name))
+        try:
+            files = self.ai.generate_code(task.plan, context=self.context)
+            task.generated_files = files
+            workspace.write_files(files)
+            self._inject_conftest_if_needed(workspace, task)
+            self._normalize_test_command(task, workspace)
+            logger.info(
+                "Generate stage complete: %d files written", len(files)
+            )
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status="SUCCESS"))
+        except Exception:
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status="FAILED"))
+            raise
 
     def _stage_install(self, task: Task, workspace: Workspace) -> ExecResult:
         """
@@ -308,23 +355,39 @@ class TaskEngine:
         Returns ExecResult — caller decides whether to enter fix loop.
         """
         task.transition(TaskStatus.EXECUTING)
-        result = self._run_install(task.plan, workspace, task.venv_executables)
-        return result
+        stage_name = task.status.name
+        self.event_bus.emit(PipelineStageStartedEvent(task_id=task.id, stage=stage_name))
+        try:
+            result = self._run_install(task.plan, workspace, task.venv_executables)
+            status_str = "SUCCESS" if result.success else "FAILED"
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status=status_str))
+            return result
+        except Exception:
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status="FAILED"))
+            raise
 
     def _stage_test(self, task: Task, workspace: Workspace) -> ValidationResult:
         """
         Stage: VALIDATING
         Run tests and return a ValidationResult (Stage 1 + Stage 2).
         """
-        test_result = self._run_tests(task.plan, workspace, task)
-        vr = validate_result(
-            result=test_result,
-            command_type="test",
-            task_description=task.raw_input,
-            generated_code=json.dumps(task.generated_files, indent=2),
-            ai=self.ai,
-        )
-        return vr
+        stage_name = task.status.name
+        self.event_bus.emit(PipelineStageStartedEvent(task_id=task.id, stage=stage_name))
+        try:
+            test_result = self._run_tests(task.plan, workspace, task)
+            vr = validate_result(
+                result=test_result,
+                command_type="test",
+                task_description=task.raw_input,
+                generated_code=json.dumps(task.generated_files, indent=2),
+                ai=self.ai,
+            )
+            status_str = "SUCCESS" if vr.is_success else "FAILED"
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status=status_str))
+            return vr
+        except Exception:
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status="FAILED"))
+            raise
 
     def _stage_complete(
         self, task: Task, workspace: Workspace, iterations: int
@@ -333,21 +396,28 @@ class TaskEngine:
         Stage: DONE
         Archive workspace and set success result on task.
         """
-        zip_path = workspace.archive()
-        task.result = TaskResult(
-            success=True,
-            output_path=zip_path,
-            summary=(
-                "Completed successfully"
-                if iterations == 0
-                else f"Fixed after {iterations} iteration(s)"
-            ),
-            iterations_used=iterations,
-        )
         task.transition(TaskStatus.DONE)
-        logger.info("✅ DONE [%s] — %s", task.id, task.result.summary)
-        if self.context:
-            self.context.add_message("assistant", task.result.summary)
+        stage_name = task.status.name
+        self.event_bus.emit(PipelineStageStartedEvent(task_id=task.id, stage=stage_name))
+        try:
+            zip_path = workspace.archive()
+            task.result = TaskResult(
+                success=True,
+                output_path=zip_path,
+                summary=(
+                    "Completed successfully"
+                    if iterations == 0
+                    else f"Fixed after {iterations} iteration(s)"
+                ),
+                iterations_used=iterations,
+            )
+            logger.info("✅ DONE [%s] — %s", task.id, task.result.summary)
+            if self.context:
+                self.context.add_message("assistant", task.result.summary)
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status="SUCCESS"))
+        except Exception:
+            self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage=stage_name, status="FAILED"))
+            raise
 
     # ══════════════════════════════════════════════════════════════════════════
     # Fix loop
@@ -370,85 +440,172 @@ class TaskEngine:
         task.transition(TaskStatus.FIXING)
         logger.info("Entering fix loop (max %d iterations)", max_iters)
 
-        for i in range(1, max_iters + 1):
-            task.increment_fix_iteration()
-            logger.info("Fix iteration %d/%d", i, max_iters)
+        self.event_bus.emit(RepairLoopStartedEvent(task_id=task.id, max_iterations=max_iters))
+        self.event_bus.emit(PipelineStageStartedEvent(task_id=task.id, stage="FIXING"))
 
-            _error_category = classify_error(
-                stderr=task.last_stderr or "",
-                stdout=task.last_stdout or "",
-            )
-            logger.info("Error classified as: %s", _error_category)
+        loop_completed = False
+        current_iter = 0
+        try:
+            for i in range(1, max_iters + 1):
+                current_iter = i
+                task.increment_fix_iteration()
+                logger.info("Fix iteration %d/%d", i, max_iters)
 
-            fixed_files = self.ai.generate_fix(
-                plan=task.plan,
-                current_files=task.generated_files,
-                stdout=task.last_stdout,
-                stderr=task.last_stderr,
-                error=current_error,
-                iteration=i,
-                attempt_history=attempt_history,
-                context=self.context,
-                semantic_reason=current_vr.semantic_reason if current_vr else None,
-                semantic_issues=current_vr.semantic_issues if current_vr else None,
-                error_category=_error_category,
-            )
-
-            if not fixed_files:
-                logger.warning("Fix iteration %d returned no changes", i)
-                attempt_history.append(f"Iteration {i}: AI returned no changes.")
-                continue
-
-            merged = {**task.generated_files, **fixed_files}
-            task.generated_files = merged
-            workspace.update_files(fixed_files)
-            self._inject_conftest_if_needed(workspace, task)
-            self._normalize_test_command(task, workspace)
-
-            if "requirements.txt" in fixed_files:
-                logger.info("requirements.txt changed — re-running install")
-                self._run_install(task.plan, workspace, task.venv_executables)
-
-            task.transition(TaskStatus.VALIDATING)
-            current_vr = self._stage_test(task, workspace)
-
-            if current_vr.is_success:
-                self._stage_complete(task, workspace, iterations=i)
-                return
-
-            if (
-                getattr(current_vr.stage1_result, "timed_out", False)
-                or current_vr.stage1_result.returncode == -1
-            ):
-                raise MaxRetriesExceeded(
-                    f"Execution timed out during fix iteration {i} — aborting (non-fixable)"
+                _error_category = classify_error(
+                    stderr=task.last_stderr or "",
+                    stdout=task.last_stdout or "",
                 )
-            if getattr(current_vr.stage1_result, "security_blocked", False):
-                raise MaxRetriesExceeded(
-                    f"Security violation during fix iteration {i} — aborting: "
-                    f"{current_vr.stage1_result.stderr[:200]}"
+                logger.info("Error classified as: %s", _error_category)
+
+                self.event_bus.emit(
+                    RepairIterationStartedEvent(
+                        task_id=task.id,
+                        iteration=i,
+                        error_category=_error_category,
+                    )
                 )
 
-            current_error = build_error_context(current_vr, "test")
-            from nexus.core.contracts import ExecutionOutput
-            task.record_execution(ExecutionOutput(
-                returncode=current_vr.stage1_result.returncode,
-                stdout=current_vr.stage1_result.stdout,
-                stderr=current_vr.stage1_result.stderr,
-                timed_out=getattr(current_vr.stage1_result, "timed_out", False),
-            ))
-            attempt_history.append(
-                f"Iteration {i}: changed {list(fixed_files.keys())} — "
-                f"still failed: {current_vr.stage1_result.stderr[-400:]}"
+                fixed_files = self.ai.generate_fix(
+                    plan=task.plan,
+                    current_files=task.generated_files,
+                    stdout=task.last_stdout,
+                    stderr=task.last_stderr,
+                    error=current_error,
+                    iteration=i,
+                    attempt_history=attempt_history,
+                    context=self.context,
+                    semantic_reason=current_vr.semantic_reason if current_vr else None,
+                    semantic_issues=current_vr.semantic_issues if current_vr else None,
+                    error_category=_error_category,
+                )
+
+                if not fixed_files:
+                    logger.warning("Fix iteration %d returned no changes", i)
+                    attempt_history.append(f"Iteration {i}: AI returned no changes.")
+                    self.event_bus.emit(
+                        RepairIterationFinishedEvent(
+                            task_id=task.id,
+                            iteration=i,
+                            success=False,
+                            error_category=_error_category,
+                        )
+                    )
+                    continue
+
+                merged = {**task.generated_files, **fixed_files}
+                task.generated_files = merged
+                workspace.update_files(fixed_files)
+                self._inject_conftest_if_needed(workspace, task)
+                self._normalize_test_command(task, workspace)
+
+                if "requirements.txt" in fixed_files:
+                    logger.info("requirements.txt changed — re-running install")
+                    self._run_install(task.plan, workspace, task.venv_executables)
+
+                task.transition(TaskStatus.VALIDATING)
+                current_vr = self._stage_test(task, workspace)
+
+                if current_vr.is_success:
+                    self._stage_complete(task, workspace, iterations=i)
+                    self.event_bus.emit(
+                        RepairIterationFinishedEvent(
+                            task_id=task.id,
+                            iteration=i,
+                            success=True,
+                            error_category=_error_category,
+                        )
+                    )
+                    self.event_bus.emit(
+                        RepairLoopFinishedEvent(
+                            task_id=task.id,
+                            success=True,
+                            iterations_used=i,
+                        )
+                    )
+                    self.event_bus.emit(
+                        PipelineStageFinishedEvent(
+                            task_id=task.id,
+                            stage="FIXING",
+                            status="SUCCESS",
+                        )
+                    )
+                    loop_completed = True
+                    return
+
+                self.event_bus.emit(
+                    RepairIterationFinishedEvent(
+                        task_id=task.id,
+                        iteration=i,
+                        success=False,
+                        error_category=_error_category,
+                    )
+                )
+
+                if (
+                    getattr(current_vr.stage1_result, "timed_out", False)
+                    or current_vr.stage1_result.returncode == -1
+                ):
+                    raise MaxRetriesExceeded(
+                        f"Execution timed out during fix iteration {i} — aborting (non-fixable)"
+                    )
+                if getattr(current_vr.stage1_result, "security_blocked", False):
+                    raise MaxRetriesExceeded(
+                        f"Security violation during fix iteration {i} — aborting: "
+                        f"{current_vr.stage1_result.stderr[:200]}"
+                    )
+
+                current_error = build_error_context(current_vr, "test")
+                from nexus.core.contracts import ExecutionOutput
+                task.record_execution(ExecutionOutput(
+                    returncode=current_vr.stage1_result.returncode,
+                    stdout=current_vr.stage1_result.stdout,
+                    stderr=current_vr.stage1_result.stderr,
+                    timed_out=getattr(current_vr.stage1_result, "timed_out", False),
+                ))
+                attempt_history.append(
+                    f"Iteration {i}: changed {list(fixed_files.keys())} — "
+                    f"still failed: {current_vr.stage1_result.stderr[-400:]}"
+                )
+
+                if i < max_iters:
+                    task.transition(TaskStatus.FIXING)
+
+            self.event_bus.emit(
+                RepairLoopFinishedEvent(
+                    task_id=task.id,
+                    success=False,
+                    iterations_used=max_iters,
+                )
             )
-
-            if i < max_iters:
-                task.transition(TaskStatus.FIXING)
-
-        raise MaxRetriesExceeded(
-            f"Fix loop exhausted after {max_iters} iterations. "
-            f"Last error: {current_error[:200]}"
-        )
+            self.event_bus.emit(
+                PipelineStageFinishedEvent(
+                    task_id=task.id,
+                    stage="FIXING",
+                    status="FAILED",
+                )
+            )
+            loop_completed = True
+            raise MaxRetriesExceeded(
+                f"Fix loop exhausted after {max_iters} iterations. "
+                f"Last error: {current_error[:200]}"
+            )
+        except Exception:
+            if not loop_completed:
+                self.event_bus.emit(
+                    RepairLoopFinishedEvent(
+                        task_id=task.id,
+                        success=False,
+                        iterations_used=current_iter,
+                    )
+                )
+                self.event_bus.emit(
+                    PipelineStageFinishedEvent(
+                        task_id=task.id,
+                        stage="FIXING",
+                        status="FAILED",
+                    )
+                )
+            raise
 
     # ══════════════════════════════════════════════════════════════════════════
     # Helpers (unchanged from original)
@@ -714,6 +871,7 @@ class TaskEngine:
 
     def _fail_task(self, task: "Task", reason: str) -> None:
         """Mark task FAILED with human-readable reason. Safe from any pipeline state."""
+        self.event_bus.emit(PipelineStageStartedEvent(task_id=task.id, stage="FAILED"))
         try:
             task.transition(TaskStatus.FAILED)
         except Exception:
@@ -724,6 +882,7 @@ class TaskEngine:
             iterations_used=task.fix_iteration,
         )
         logger.error("Task [%s] FAILED: %s", task.id, reason)
+        self.event_bus.emit(PipelineStageFinishedEvent(task_id=task.id, stage="FAILED", status="SUCCESS"))
 
     def _shutdown_cleanup(self) -> None:
         try:

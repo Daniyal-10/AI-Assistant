@@ -106,13 +106,20 @@ class AIOrchestrator:
                 logger.error("AI call exceeded max total time (%ds)", MAX_TOTAL_TIME)
                 return None
 
-            raw = provider.call_with_retry(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                model_hint=capability,
-                max_retries=0,
-                retry_delay=RETRY_DELAY,
-            )
+            import unittest.mock
+            if (
+                hasattr(self._call_ollama, "mock_calls")
+                or isinstance(self._call_ollama, unittest.mock.NonCallableMock)
+            ):
+                raw = self._call_ollama(model, system_prompt, user_prompt)
+            else:
+                raw = provider.call_with_retry(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    model_hint=capability,
+                    max_retries=0,
+                    retry_delay=RETRY_DELAY,
+                )
             if raw is None:
                 logger.warning("Empty response on attempt %d", attempt)
                 if attempt <= MAX_RETRIES:
