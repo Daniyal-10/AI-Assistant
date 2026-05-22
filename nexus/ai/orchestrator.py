@@ -36,6 +36,7 @@ from nexus.utils.config import config
 from nexus.utils.logger import get_logger
 from nexus.ai.providers.ollama_provider import OllamaProvider
 from nexus.ai.providers.anthropic_provider import AnthropicProvider
+from nexus.ai.providers.registry import ProviderRegistry
 from nexus.repair.classifier import classify_error
 from nexus.repair.targeting import select_files_for_fix
 from nexus.repair.strategy import get_repair_strategy, is_terminal_error
@@ -60,48 +61,26 @@ class AIOrchestrator:
         self._skills = SkillRegistry()
         self._assembler = ContextAssembler(token_budget=2000)
 
+        # Provider Registry setup
+        self._ollama_provider = OllamaProvider()
+        self._anthropic_provider = AnthropicProvider()
+        self._registry = ProviderRegistry()
+        self._registry.register(self._ollama_provider, priority=100)
+        self._registry.register(self._anthropic_provider, priority=50)
+
     def _call_ollama(
         self,
         model: str,
         system_prompt: str,
         user_prompt: str,
     ) -> Optional[str]:
-        payload = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "stream": False,
-            "options": {
-                "temperature": 0.1,
-                "num_predict": 4096,
-            },
-        }
-        try:
-            response = requests.post(
-                f"{self._base_url}/api/chat",
-                json=payload,
-                timeout=self._timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-            content = data.get("message", {}).get("content")
-            if not content:
-                logger.warning("Ollama returned empty content: %s", data)
-                return None
-            return content
-        except requests.exceptions.ConnectionError as e:
-            raise OllamaConnectionError(
-                f"Cannot connect to Ollama at {self._base_url}. "
-                f"Is Ollama running? Error: {e}"
-            ) from e
-        except requests.exceptions.Timeout:
-            logger.error("Ollama request timed out after %ds", self._timeout)
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error("Ollama request failed: %s", e)
-            return None
+        # DEPRECATED: use OllamaProvider directly
+        model_hint = "code" if model == self._code_model else "reason"
+        return self._ollama_provider.call(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model_hint=model_hint,
+        )
 
     def _call_with_retry(
         self,
@@ -111,6 +90,12 @@ class AIOrchestrator:
         validator_fn: Callable[[Dict], bool],
         normalize_fn: Optional[Callable[[Dict], Dict]] = None,
     ) -> Optional[Dict[str, Any]]:
+        capability = "code" if model == self._code_model else "reason"
+        provider = self._registry.resolve(capability)
+        if provider is None:
+            logger.error("No available provider resolved for capability '%s'", capability)
+            return None
+
         start_time = time.time()
         max_attempts = MAX_RETRIES + 1
 
@@ -121,7 +106,13 @@ class AIOrchestrator:
                 logger.error("AI call exceeded max total time (%ds)", MAX_TOTAL_TIME)
                 return None
 
-            raw = self._call_ollama(model, system_prompt, user_prompt)
+            raw = provider.call_with_retry(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model_hint=capability,
+                max_retries=0,
+                retry_delay=RETRY_DELAY,
+            )
             if raw is None:
                 logger.warning("Empty response on attempt %d", attempt)
                 if attempt <= MAX_RETRIES:
@@ -155,45 +146,13 @@ class AIOrchestrator:
         return None
 
     def _call_claude(self, system_prompt: str, user_prompt: str, iteration: int) -> Optional[str]:
-        """Call Anthropic Claude API as a fallback."""
-        if not config.anthropic_api_key:
-            logger.error("Claude fallback attempted but ANTHROPIC_API_KEY is missing")
-            return None
-
+        # DEPRECATED: use AnthropicProvider directly
         logger.info("Routing to Claude API fallback (fix iteration %d)", iteration)
-        url = "https://api.anthropic.com/v1/messages"
-        headers = {
-            "x-api-key": config.anthropic_api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        payload = {
-            "model": config.fallback_model,
-            "max_tokens": 4096,
-            "temperature": 0.1,
-            "system": system_prompt,
-            "messages": [
-                {"role": "user", "content": user_prompt}
-            ],
-        }
-
-        try:
-            # Using same pattern as _call_ollama with raw requests
-            response = requests.post(url, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            data = response.json()
-            
-            usage = data.get("usage")
-            if usage:
-                logger.debug("Claude token usage: %s", usage)
-                
-            content = data.get("content")
-            if content and len(content) > 0:
-                return content[0].get("text")
-            
-            return None
-        except requests.exceptions.RequestException as e:
-            raise CloudProviderError(f"Anthropic API request failed: {e}")
+        return self._anthropic_provider.call(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model_hint="reason",
+        )
 
     def generate_plan(self, user_input: str, context: Optional[Any] = None) -> Dict[str, Any]:
         logger.info("Generating plan for: %s", user_input[:80])
