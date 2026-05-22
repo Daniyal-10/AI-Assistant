@@ -6,6 +6,13 @@ build-backend = "setuptools.build_meta"
 name = "nexus"
 version = "0.1.0"
 requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.136.1",
+    "openai>=2.38.0",
+    "python-dotenv>=1.2.2",
+    "redis>=7.4.0",
+    "websockets>=16.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -17,4 +24,11 @@ markers = [
     "integration: tests for component interaction",
     "e2e: full pipeline end-to-end tests",
     "requires_docker: tests that require a functional docker daemon"
+]
+
+[dependency-groups]
+dev = [
+    "black>=26.5.1",
+    "pytest>=9.0.3",
+    "ruff>=0.15.14",
 ]

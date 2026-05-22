@@ -43,6 +43,38 @@ def extract_json(raw: str) -> Optional[Dict[str, Any]]:
 
     raw = raw.strip()
 
+    # Pre-process: replace triple-quoted strings with single-quoted equivalents
+    # Local 7B models (qwen, llama) often output triple quotes inside JSON
+    # which breaks all JSON parsers. We sanitize before any parse attempt.
+    import re
+
+    def _replace_triple_quotes(text: str) -> str:
+        """Replace triple-quoted Python strings inside JSON with escaped single-line strings."""
+        result = []
+        i = 0
+        while i < len(text):
+            if text[i:i+3] == '"""':
+                # Find the closing triple quote
+                end = text.find('"""', i + 3)
+                if end == -1:
+                    result.append(text[i:])
+                    break
+                # Extract content between triple quotes
+                content = text[i+3:end]
+                # Escape backslashes, then escape double quotes, then collapse newlines
+                content = content.replace('\\', '\\\\')
+                content = content.replace('"', '\\"')
+                content = content.replace('\n', '\\n')
+                content = content.replace('\r', '')
+                result.append('"' + content + '"')
+                i = end + 3
+            else:
+                result.append(text[i])
+                i += 1
+        return ''.join(result)
+
+    raw = _replace_triple_quotes(raw)
+
     # ── Strategy 1: Direct parse ──────────────────────────────────────────────
     try:
         return json.loads(raw)
